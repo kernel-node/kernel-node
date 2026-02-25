@@ -319,7 +319,7 @@ fn main() {
         );
     let chainman = Arc::new(chainman_builder.build().unwrap());
 
-    let (block_tx, block_rx) = mpsc::sync_channel(1);
+    let (block_tx, block_rx) = mpsc::sync_channel(32);
     let (addr_tx, addr_rx) = mpsc::channel();
 
     let node_state = Arc::new(NodeState {

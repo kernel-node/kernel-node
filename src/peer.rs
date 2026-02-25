@@ -332,6 +332,9 @@ pub struct PeerManager {
     /// Writers for each active peer, used to kill connections on shutdown.
     /// Each slot corresponds to a peer thread index.
     peer_writers: Vec<Arc<Mutex<Option<Arc<ConnectionWriter>>>>>,
+    /// Tracks which peer addresses are currently connected, preventing
+    /// multiple threads from connecting to the same peer.
+    connected_peers: Arc<Mutex<HashSet<SocketAddr>>>,
 }
 
 const TABLE_WIDTH: usize = 16;
@@ -356,6 +359,7 @@ impl PeerManager {
             running: Arc::new(AtomicBool::new(true)),
             peer_threads: Vec::new(),
             peer_writers: Vec::new(),
+            connected_peers: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -398,6 +402,8 @@ impl PeerManager {
             let writer_slot_clone = Arc::clone(&writer_slot);
             self.peer_writers.push(writer_slot);
 
+            let connected_peers = Arc::clone(&self.connected_peers);
+
             let handle = thread::spawn(move || {
                 info!("Peer thread {} started", i);
                 while running.load(Ordering::SeqCst) {
@@ -422,6 +428,16 @@ impl PeerManager {
                         }
                     };
 
+                    // Skip if another thread is already connected to this peer.
+                    {
+                        let mut peers = connected_peers.lock().unwrap();
+                        if peers.contains(&socket_addr) {
+                            debug!("Peer thread {}: skipping {} (already connected)", i, socket_addr);
+                            continue;
+                        }
+                        peers.insert(socket_addr);
+                    }
+
                     let peer = BitcoinPeer::new(socket_addr, network, &node_state);
                     let mut peer = match peer {
                         Ok(connection) => {
@@ -431,6 +447,7 @@ impl PeerManager {
                         }
                         Err(e) => {
                             error!("Peer thread {}: could not connect to {}: {}", i, socket_addr, e);
+                            connected_peers.lock().unwrap().remove(&socket_addr);
                             thread::sleep(Duration::from_millis(500));
                             continue;
                         }
@@ -453,7 +470,8 @@ impl PeerManager {
                             break;
                         }
                     }
-                    // Clear the writer so stale detection doesn't kill a dead connection.
+                    // Remove from connected set and clear writer.
+                    connected_peers.lock().unwrap().remove(&socket_addr);
                     let mut w = writer_slot_clone.lock().unwrap();
                     *w = None;
                 }
