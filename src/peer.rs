@@ -190,7 +190,6 @@ fn build_block_locator(chainman: &ChainstateManager) -> Vec<BlockHash> {
         if index == 0 {
             break;
         }
-        // After the first 10 entries, double the step each time.
         if locator.len() > 10 {
             step *= 2;
         }
@@ -260,8 +259,6 @@ pub fn process_message(
                 }
 
                 if headers.0.len() != 2000 {
-                    // Headers sync complete. Build the download queue from
-                    // the header chain and start downloading directly.
                     node_state.headers_synced.store(true, Ordering::SeqCst);
                     populate_download_queue(&node_state.chainman, &node_state.download_queue);
                     let batch = pop_download_batch(
@@ -278,7 +275,6 @@ pub fn process_message(
                             vec![create_getdata_message(&batch)],
                         );
                     }
-                    // Queue empty (already caught up). Fall back to inv-based sync.
                     let locator = build_block_locator(&node_state.chainman);
                     return (PeerStateMachine::AwaitingInv, vec![create_getblocks_message(locator)]);
                 }
@@ -304,7 +300,6 @@ pub fn process_message(
                     .collect();
 
                 if !block_hashes.is_empty() {
-                    // Claim only blocks not already being downloaded by another peer.
                     let mut in_flight = node_state.in_flight_blocks.lock().unwrap();
                     let claimed: Vec<bitcoin::BlockHash> = block_hashes
                         .into_iter()
@@ -325,9 +320,6 @@ pub fn process_message(
                             vec![create_getdata_message(&claimed)],
                         )
                     } else {
-                        // All blocks already claimed by other peers.
-                        // Re-request with locator; network round-trip
-                        // gives other peers time to finish.
                         let locator = build_block_locator(&node_state.chainman);
                         (PeerStateMachine::AwaitingInv, vec![create_getblocks_message(locator)])
                     }
@@ -346,7 +338,6 @@ pub fn process_message(
                 let block_hash = block.block_hash();
                 let prev_blockhash = block.header().prev_blockhash;
                 block_state.peer_inventory.remove(&block_hash);
-                // Release from global in-flight set now that we have the block.
                 node_state.in_flight_blocks.lock().unwrap().remove(&block_hash);
                 block_state
                     .block_buffer
@@ -366,7 +357,6 @@ pub fn process_message(
                 // blocks in the buffer and request the next batch.
                 if block_state.peer_inventory.is_empty() {
                     block_state.block_buffer.clear();
-                    // Try to get the next batch from the download queue.
                     let batch = pop_download_batch(
                         &node_state.download_queue,
                         &node_state.in_flight_blocks,
@@ -381,7 +371,6 @@ pub fn process_message(
                             vec![create_getdata_message(&batch)],
                         )
                     } else {
-                        // Queue exhausted. Fall back to inv-based sync.
                         let locator = build_block_locator(&node_state.chainman);
                         (
                             PeerStateMachine::AwaitingInv,
@@ -435,8 +424,6 @@ impl BitcoinPeer {
         let addr = Address::new(&socket_addr, ServiceFlags::WITNESS);
         info!("Connected to {:?}", addr);
 
-        // If headers are already synced by another peer, skip straight
-        // to block downloading from the shared queue.
         let state_machine;
         if node_state.headers_synced.load(Ordering::SeqCst) {
             let batch = pop_download_batch(
@@ -521,7 +508,6 @@ impl BitcoinPeer {
         node_state: &NodeState,
     ) -> Result<(), p2p::net::Error> {
         let msg = self.receive_message()?;
-        // A block message means the peer is making progress.
         let is_block = matches!(msg, NetworkMessage::Block(_));
         let old_state = std::mem::take(&mut self.state_machine);
         let (peer_state_machine, mut messages) = process_message(old_state, msg, node_state);
@@ -659,7 +645,6 @@ impl PeerManager {
                         }
                     };
 
-                    // Skip if another thread is already connected to this peer.
                     {
                         let mut peers = connected_peers.lock().unwrap();
                         if peers.contains(&socket_addr) {
@@ -705,10 +690,7 @@ impl PeerManager {
                             break;
                         }
                     }
-                    // Return any blocks this peer claimed but never received
-                    // to the download queue so other peers can pick them up.
                     peer.release_in_flight(&node_state.download_queue, &node_state.in_flight_blocks);
-                    // Remove from connected set and clear writer.
                     connected_peers.lock().unwrap().remove(&socket_addr);
                     let mut w = writer_slot_clone.lock().unwrap();
                     *w = None;
@@ -746,9 +728,6 @@ mod tests {
     fn hash(n: u8) -> BlockHash {
         BlockHash::from_byte_array([n; 32])
     }
-
-    // --- pop_download_batch tests ---
-
     #[test]
     fn pop_download_batch_returns_requested_count() {
         let queue = Mutex::new(VecDeque::from(vec![hash(1), hash(2), hash(3), hash(4)]));
@@ -757,7 +736,6 @@ mod tests {
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0], hash(1));
         assert_eq!(batch[1], hash(2));
-        // Remaining in queue
         assert_eq!(queue.lock().unwrap().len(), 2);
     }
 
@@ -776,7 +754,6 @@ mod tests {
         let queue = Mutex::new(VecDeque::from(vec![hash(1), hash(2), hash(3)]));
         let in_flight = Mutex::new(HashSet::from([hash(2)]));
         let batch = pop_download_batch(&queue, &in_flight, 3);
-        // hash(2) was already in-flight, so it's skipped (but still popped from queue)
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0], hash(1));
         assert_eq!(batch[1], hash(3));
@@ -805,7 +782,6 @@ mod tests {
         let in_flight = Mutex::new(HashSet::from([hash(1), hash(2)]));
         let batch = pop_download_batch(&queue, &in_flight, 16);
         assert!(batch.is_empty());
-        // Queue should be drained even though nothing was claimed
         assert!(queue.lock().unwrap().is_empty());
     }
 
@@ -820,25 +796,16 @@ mod tests {
         assert_eq!(batch2, vec![hash(3), hash(4)]);
         assert!(batch3.is_empty());
     }
-
-    // --- TipState tests ---
-
     #[test]
     fn tip_state_default_is_genesis() {
         let state = TipState::default();
         assert_eq!(state.block_hash, BlockHash::GENESIS_PREVIOUS_BLOCK_HASH);
     }
-
-    // --- PeerStateMachine tests ---
-
     #[test]
     fn peer_state_machine_default_is_awaiting_headers() {
         let state = PeerStateMachine::default();
         assert!(matches!(state, PeerStateMachine::AwaitingHeaders));
     }
-
-    // --- Message construction tests ---
-
     #[test]
     fn create_getdata_message_wraps_as_witness_block() {
         let hashes = vec![hash(1), hash(2)];
@@ -865,17 +832,11 @@ mod tests {
             _ => panic!("expected GetHeaders message"),
         }
     }
-
-    // --- release_in_flight tests ---
-
     #[test]
     fn release_returns_blocks_to_queue_front() {
-        // Simulate what release_in_flight does: remove from in_flight,
-        // push to front of queue.
         let queue = Mutex::new(VecDeque::from(vec![hash(5), hash(6)]));
         let in_flight = Mutex::new(HashSet::from([hash(1), hash(2), hash(3)]));
 
-        // Simulate peer disconnect with unreceived blocks hash(1), hash(2)
         let unreceived = vec![hash(1), hash(2)];
         {
             let mut q = queue.lock().unwrap();
@@ -886,16 +847,13 @@ mod tests {
             }
         }
 
-        // Unreceived blocks should be at the front of the queue
         let q = queue.lock().unwrap();
         assert_eq!(q.len(), 4);
-        // push_front inserts in reverse order, so hash(2) then hash(1)
         assert!(q.contains(&hash(1)));
         assert!(q.contains(&hash(2)));
         assert!(q.contains(&hash(5)));
         assert!(q.contains(&hash(6)));
 
-        // Only hash(3) should remain in-flight
         let set = in_flight.lock().unwrap();
         assert!(!set.contains(&hash(1)));
         assert!(!set.contains(&hash(2)));
@@ -907,7 +865,6 @@ mod tests {
         let queue = Mutex::new(VecDeque::from(vec![hash(5)]));
         let in_flight = Mutex::new(HashSet::from([hash(1)]));
 
-        // Simulate disconnect: return hash(1) to queue
         {
             let mut q = queue.lock().unwrap();
             let mut set = in_flight.lock().unwrap();
@@ -915,7 +872,6 @@ mod tests {
             q.push_front(hash(1));
         }
 
-        // Now pop_download_batch should pick up hash(1) again
         let batch = pop_download_batch(&queue, &in_flight, 16);
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0], hash(1));
@@ -935,9 +891,6 @@ mod tests {
             _ => panic!("expected GetBlocks message"),
         }
     }
-
-    // --- Additional message construction tests ---
-
     #[test]
     fn create_getdata_message_all_items_are_witness_block() {
         let hashes = vec![hash(1), hash(2), hash(3)];
@@ -987,16 +940,12 @@ mod tests {
             _ => panic!("expected GetBlocks message"),
         }
     }
-
-    // --- Additional pop_download_batch tests ---
-
     #[test]
     fn pop_download_batch_zero_batch_size() {
         let queue = Mutex::new(VecDeque::from(vec![hash(1), hash(2)]));
         let in_flight = Mutex::new(HashSet::new());
         let batch = pop_download_batch(&queue, &in_flight, 0);
         assert!(batch.is_empty());
-        // Queue should be untouched
         assert_eq!(queue.lock().unwrap().len(), 2);
     }
 
@@ -1007,9 +956,6 @@ mod tests {
         let batch = pop_download_batch(&queue, &in_flight, 5);
         assert_eq!(batch, vec![hash(1), hash(2), hash(3), hash(4), hash(5)]);
     }
-
-    // --- TipState tests ---
-
     #[test]
     fn tip_state_clone_is_independent() {
         let original = TipState { block_hash: hash(1) };
@@ -1017,5 +963,147 @@ mod tests {
         cloned.block_hash = hash(2);
         assert_eq!(original.block_hash, hash(1));
         assert_eq!(cloned.block_hash, hash(2));
+    }
+
+    use bitcoinkernel::{ChainType, ChainstateManagerBuilder, ContextBuilder};
+    use p2p::p2p_message_types::message::HeadersMessage;
+    use tempfile::TempDir;
+
+    fn setup_regtest() -> (TempDir, Arc<NodeState>) {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let data_dir = tmp.path().join("data");
+        let blocks_dir = tmp.path().join("blocks");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&blocks_dir).unwrap();
+
+        let context = Arc::new(
+            ContextBuilder::new()
+                .chain_type(ChainType::Regtest)
+                .build()
+                .expect("failed to build regtest context"),
+        );
+
+        let chainman = Arc::new(
+            ChainstateManagerBuilder::new(
+                &context,
+                data_dir.to_str().unwrap(),
+                blocks_dir.to_str().unwrap(),
+            )
+            .expect("failed to create chainstate manager builder")
+            .build()
+            .expect("failed to build chainstate manager"),
+        );
+
+        chainman.import_blocks().expect("failed to import blocks");
+
+        let (block_tx, _block_rx) = mpsc::sync_channel(32);
+        let (addr_tx, _addr_rx) = mpsc::channel();
+        let tip_hash = BlockHash::from_byte_array(
+            chainman.active_chain().tip().block_hash().to_bytes(),
+        );
+
+        let node_state = Arc::new(NodeState {
+            addr_tx,
+            block_tx,
+            tip_state: Arc::new(Mutex::new(TipState {
+                block_hash: tip_hash,
+            })),
+            context,
+            chainman,
+            in_flight_blocks: Mutex::new(HashSet::new()),
+            download_queue: Mutex::new(VecDeque::new()),
+            headers_synced: AtomicBool::new(false),
+        });
+
+        (tmp, node_state)
+    }
+
+    #[test]
+    fn regtest_initial_chain_state() {
+        let (_tmp, node_state) = setup_regtest();
+        let height = node_state.chainman.active_chain().height();
+        assert_eq!(height, 0, "regtest should start at height 0");
+        assert!(!node_state.headers_synced.load(Ordering::SeqCst));
+        assert!(node_state.download_queue.lock().unwrap().is_empty());
+        assert!(node_state.in_flight_blocks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn regtest_process_ping_returns_pong() {
+        let (_tmp, node_state) = setup_regtest();
+        let (state, messages) = process_message(
+            PeerStateMachine::AwaitingHeaders,
+            NetworkMessage::Ping(42),
+            &node_state,
+        );
+        assert!(matches!(state, PeerStateMachine::AwaitingHeaders));
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0], NetworkMessage::Pong(42)));
+    }
+
+    #[test]
+    fn regtest_empty_headers_completes_sync() {
+        let (_tmp, node_state) = setup_regtest();
+        let (state, messages) = process_message(
+            PeerStateMachine::AwaitingHeaders,
+            NetworkMessage::Headers(HeadersMessage(vec![])),
+            &node_state,
+        );
+        assert!(node_state.headers_synced.load(Ordering::SeqCst));
+        assert!(matches!(state, PeerStateMachine::AwaitingInv));
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0], NetworkMessage::GetBlocks(_)));
+    }
+
+    #[test]
+    fn regtest_headers_synced_flag_persists() {
+        let (_tmp, node_state) = setup_regtest();
+        let _ = process_message(
+            PeerStateMachine::AwaitingHeaders,
+            NetworkMessage::Headers(HeadersMessage(vec![])),
+            &node_state,
+        );
+        assert!(node_state.headers_synced.load(Ordering::SeqCst));
+        let _ = process_message(
+            PeerStateMachine::AwaitingHeaders,
+            NetworkMessage::Headers(HeadersMessage(vec![])),
+            &node_state,
+        );
+        assert!(node_state.headers_synced.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn regtest_process_block_header_genesis() {
+        let (_tmp, node_state) = setup_regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let kernel_header = bitcoin_header_to_kernel_header(genesis.header());
+        let result = node_state.chainman.process_block_header(&kernel_header);
+        assert!(matches!(result, ProcessBlockHeaderResult::Success(_)));
+    }
+
+    #[test]
+    fn regtest_inv_deduplication() {
+        let (_tmp, node_state) = setup_regtest();
+        let (state, _) = process_message(
+            PeerStateMachine::AwaitingHeaders,
+            NetworkMessage::Headers(HeadersMessage(vec![])),
+            &node_state,
+        );
+        assert!(matches!(state, PeerStateMachine::AwaitingInv));
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis.header().block_hash();
+        let inv = NetworkMessage::Inv(InventoryPayload(vec![Inventory::Block(genesis_hash)]));
+        let (state, messages) = process_message(state, inv, &node_state);
+        assert!(node_state.in_flight_blocks.lock().unwrap().contains(&genesis_hash));
+        assert!(matches!(state, PeerStateMachine::AwaitingBlock(_)));
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0], NetworkMessage::GetData(_)));
+
+        let inv2 = NetworkMessage::Inv(InventoryPayload(vec![Inventory::Block(genesis_hash)]));
+        let (state2, messages2) = process_message(PeerStateMachine::AwaitingInv, inv2, &node_state);
+        assert!(matches!(state2, PeerStateMachine::AwaitingInv));
+        assert_eq!(messages2.len(), 1);
+        assert!(matches!(messages2[0], NetworkMessage::GetBlocks(_)));
     }
 }

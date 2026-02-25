@@ -203,9 +203,6 @@ fn run(
     let peer_manager_addrman = Arc::clone(peer_manager.addrman());
     let running_block = peer_manager.running();
 
-    // Spawn the address processing thread. It drains addresses from the
-    // addr_rx channel and adds them to the shared address manager so that
-    // peer threads can discover new peers.
     let running_addr = Arc::clone(&running_block);
     let addr_processing_handler = thread::spawn(move || {
         info!("Starting addr processing thread.");
@@ -229,10 +226,6 @@ fn run(
         info!("Stopping addr processing thread.");
     });
 
-    // Spawn the block processing thread. It validates blocks sent by any
-    // peer thread through the shared block_tx channel. If no blocks arrive
-    // for STALE_BLOCK_DURATION, it kills all peer connections to force
-    // reconnection to hopefully faster peers.
     let peer_writers = peer_manager.peer_writers().to_vec();
     let node_state_block = Arc::clone(&node_state);
     let block_processing_handler = thread::spawn(move || {
@@ -292,10 +285,8 @@ fn run(
         info!("Stopping block processing thread.");
     });
 
-    // Start all peer threads.
     peer_manager.start();
 
-    // Wait for shutdown signal (Ctrl+C or fatal error).
     if let Ok(()) = shutdown_rx.recv() {
         context.interrupt().unwrap();
         info!("Received shutdown signal, shutting down...");
