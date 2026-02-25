@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::DerefMut,
     sync::{
@@ -328,6 +329,7 @@ fn main() {
         tip_state,
         chainman,
         context: Arc::clone(&context),
+        in_flight_blocks: Mutex::new(HashSet::new()),
     });
 
     if let Err(err) = node_state.chainman.import_blocks() {

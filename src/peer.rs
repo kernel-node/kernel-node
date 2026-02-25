@@ -48,6 +48,10 @@ pub struct NodeState {
     pub tip_state: Arc<Mutex<TipState>>,
     pub context: Arc<Context>,
     pub chainman: Arc<ChainstateManager>,
+    /// Tracks block hashes currently being downloaded by any peer.
+    /// Peers claim hashes when requesting blocks and release them
+    /// on receipt or disconnect.
+    pub in_flight_blocks: Mutex<HashSet<BlockHash>>,
 }
 
 impl NodeState {
@@ -178,14 +182,33 @@ pub fn process_message(
                     .collect();
 
                 if !block_hashes.is_empty() {
-                    debug!("Requesting {} blocks", block_hashes.len());
-                    (
-                        PeerStateMachine::AwaitingBlock(AwaitingBlock {
-                            peer_inventory: block_hashes.iter().cloned().collect(),
-                            block_buffer: HashMap::new(),
-                        }),
-                        vec![create_getdata_message(&block_hashes)],
-                    )
+                    // Claim only blocks not already being downloaded by another peer.
+                    let mut in_flight = node_state.in_flight_blocks.lock().unwrap();
+                    let claimed: Vec<bitcoin::BlockHash> = block_hashes
+                        .into_iter()
+                        .filter(|h| !in_flight.contains(h))
+                        .collect();
+                    for h in &claimed {
+                        in_flight.insert(*h);
+                    }
+                    drop(in_flight);
+
+                    if !claimed.is_empty() {
+                        debug!("Requesting {} blocks", claimed.len());
+                        (
+                            PeerStateMachine::AwaitingBlock(AwaitingBlock {
+                                peer_inventory: claimed.iter().cloned().collect(),
+                                block_buffer: HashMap::new(),
+                            }),
+                            vec![create_getdata_message(&claimed)],
+                        )
+                    } else {
+                        // All blocks already claimed by other peers.
+                        // Re-request from current tip; network round-trip
+                        // gives other peers time to finish.
+                        let our_best = node_state.get_tip_state().block_hash;
+                        (PeerStateMachine::AwaitingInv, vec![create_getblocks_message(our_best)])
+                    }
                 } else {
                     (PeerStateMachine::AwaitingInv, vec![])
                 }
@@ -198,8 +221,11 @@ pub fn process_message(
         PeerStateMachine::AwaitingBlock(mut block_state) => match event {
             NetworkMessage::Block(block) => {
                 let block = block.assume_checked(None);
+                let block_hash = block.block_hash();
                 let prev_blockhash = block.header().prev_blockhash;
-                block_state.peer_inventory.remove(&block.block_hash());
+                block_state.peer_inventory.remove(&block_hash);
+                // Release from global in-flight set now that we have the block.
+                node_state.in_flight_blocks.lock().unwrap().remove(&block_hash);
                 block_state
                     .block_buffer
                     .insert(prev_blockhash, bitcoin_block_to_kernel_block(&block));
@@ -290,6 +316,17 @@ impl BitcoinPeer {
             .reader
             .read_message()?
             .expect("v1 only supported currently"))
+    }
+
+    /// Release any block hashes this peer claimed but never received.
+    /// Called when the peer disconnects to unblock other peers.
+    pub fn release_in_flight(&self, in_flight: &Mutex<HashSet<BlockHash>>) {
+        if let PeerStateMachine::AwaitingBlock(ref state) = self.state_machine {
+            let mut set = in_flight.lock().unwrap();
+            for hash in &state.peer_inventory {
+                set.remove(hash);
+            }
+        }
     }
 
     pub fn receive_and_process_message(
@@ -470,6 +507,8 @@ impl PeerManager {
                             break;
                         }
                     }
+                    // Release any blocks this peer claimed but never received.
+                    peer.release_in_flight(&node_state.in_flight_blocks);
                     // Remove from connected set and clear writer.
                     connected_peers.lock().unwrap().remove(&socket_addr);
                     let mut w = writer_slot_clone.lock().unwrap();
