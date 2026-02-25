@@ -234,15 +234,34 @@ fn run(
     // for STALE_BLOCK_DURATION, it kills all peer connections to force
     // reconnection to hopefully faster peers.
     let peer_writers = peer_manager.peer_writers().to_vec();
+    let node_state_block = Arc::clone(&node_state);
     let block_processing_handler = thread::spawn(move || {
         info!("Starting block processing thread.");
         let mut last_block = Instant::now();
+        let mut last_log = Instant::now();
+        let mut blocks_since_log: u64 = 0;
         while running_block.load(Ordering::SeqCst) {
             match block_rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(block) => {
                     debug!("Validating block.");
                     last_block = Instant::now();
                     let _ = chainman.process_block(&block);
+                    blocks_since_log += 1;
+                    if last_log.elapsed() >= Duration::from_secs(10) {
+                        let height = chainman.active_chain().height();
+                        let queue_remaining = node_state_block.download_queue.lock().unwrap().len();
+                        let in_flight = node_state_block.in_flight_blocks.lock().unwrap().len();
+                        info!(
+                            "Progress: height={}, validated {} blocks in {:.1}s, queue={}, in_flight={}",
+                            height,
+                            blocks_since_log,
+                            last_log.elapsed().as_secs_f64(),
+                            queue_remaining,
+                            in_flight,
+                        );
+                        blocks_since_log = 0;
+                        last_log = Instant::now();
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if last_block.elapsed() > STALE_BLOCK_DURATION {
