@@ -118,6 +118,10 @@ pub struct NodeState {
     /// Pre-built queue of block hashes to download, populated after
     /// header sync by walking backwards from the header tip.
     pub download_queue: Mutex<VecDeque<BlockHash>>,
+    /// Set to true once the first peer finishes header sync and
+    /// populates the download queue. Late-arriving peers skip
+    /// headers and go straight to block downloading.
+    pub headers_synced: AtomicBool,
 }
 
 impl NodeState {
@@ -258,6 +262,7 @@ pub fn process_message(
                 if headers.0.len() != 2000 {
                     // Headers sync complete. Build the download queue from
                     // the header chain and start downloading directly.
+                    node_state.headers_synced.store(true, Ordering::SeqCst);
                     populate_download_queue(&node_state.chainman, &node_state.download_queue);
                     let batch = pop_download_batch(
                         &node_state.download_queue,
@@ -429,11 +434,38 @@ impl BitcoinPeer {
 
         let addr = Address::new(&socket_addr, ServiceFlags::WITNESS);
         info!("Connected to {:?}", addr);
-        let state_machine = PeerStateMachine::AwaitingHeaders;
-        let locator = build_block_locator(&node_state.chainman);
-        let getheaders = create_getheaders_message(locator);
-        debug!("sending headers message...");
-        writer.send_message(getheaders)?;
+
+        // If headers are already synced by another peer, skip straight
+        // to block downloading from the shared queue.
+        let state_machine;
+        if node_state.headers_synced.load(Ordering::SeqCst) {
+            let batch = pop_download_batch(
+                &node_state.download_queue,
+                &node_state.in_flight_blocks,
+                DOWNLOAD_BATCH_SIZE,
+            );
+            if !batch.is_empty() {
+                debug!("Headers already synced, starting block download.");
+                let getdata = create_getdata_message(&batch);
+                writer.send_message(getdata)?;
+                state_machine = PeerStateMachine::AwaitingBlock(AwaitingBlock {
+                    peer_inventory: batch.iter().cloned().collect(),
+                    block_buffer: HashMap::new(),
+                });
+            } else {
+                debug!("Headers synced but queue empty, falling back to inv.");
+                let locator = build_block_locator(&node_state.chainman);
+                writer.send_message(create_getblocks_message(locator))?;
+                state_machine = PeerStateMachine::AwaitingInv;
+            }
+        } else {
+            let locator = build_block_locator(&node_state.chainman);
+            let getheaders = create_getheaders_message(locator);
+            debug!("Sending getheaders message...");
+            writer.send_message(getheaders)?;
+            state_machine = PeerStateMachine::AwaitingHeaders;
+        }
+
         let peer = BitcoinPeer {
             addr,
             writer: Arc::new(writer),

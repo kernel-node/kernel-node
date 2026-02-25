@@ -345,6 +345,7 @@ fn main() {
         context: Arc::clone(&context),
         in_flight_blocks: Mutex::new(HashSet::new()),
         download_queue: Mutex::new(VecDeque::new()),
+        headers_synced: AtomicBool::new(false),
     });
 
     if let Err(err) = node_state.chainman.import_blocks() {
