@@ -163,18 +163,50 @@ pub struct AwaitingBlock {
     pub block_buffer: HashMap<bitcoin::BlockHash /*prev */, bitcoinkernel::Block>,
 }
 
-fn create_getheaders_message(known_block_hash: bitcoin::BlockHash) -> NetworkMessage {
+/// Build a logarithmic block locator from the active chain.
+///
+/// Returns hashes at heights: tip, tip-1, tip-2, tip-3, ..., tip-10,
+/// then doubling the step (tip-12, tip-16, tip-24, ...), always ending
+/// with the genesis block. This helps the remote peer find the fork
+/// point even after a reorg.
+fn build_block_locator(chainman: &ChainstateManager) -> Vec<BlockHash> {
+    let chain = chainman.active_chain();
+    let height = chain.height();
+    if height < 0 {
+        return vec![];
+    }
+    let mut locator = Vec::new();
+    let mut index = height as usize;
+    let mut step: usize = 1;
+    loop {
+        if let Some(entry) = chain.at_height(index) {
+            let hash = BlockHash::from_byte_array(entry.block_hash().to_bytes());
+            locator.push(hash);
+        }
+        if index == 0 {
+            break;
+        }
+        // After the first 10 entries, double the step each time.
+        if locator.len() > 10 {
+            step *= 2;
+        }
+        index = index.saturating_sub(step);
+    }
+    locator
+}
+
+fn create_getheaders_message(locator_hashes: Vec<bitcoin::BlockHash>) -> NetworkMessage {
     NetworkMessage::GetHeaders(GetHeadersMessage {
         version: PROTOCOL_VERSION,
-        locator_hashes: vec![known_block_hash],
+        locator_hashes,
         stop_hash: bitcoin::BlockHash::GENESIS_PREVIOUS_BLOCK_HASH,
     })
 }
 
-fn create_getblocks_message(known_block_hash: bitcoin::BlockHash) -> NetworkMessage {
+fn create_getblocks_message(locator_hashes: Vec<bitcoin::BlockHash>) -> NetworkMessage {
     NetworkMessage::GetBlocks(GetBlocksMessage {
         version: PROTOCOL_VERSION,
-        locator_hashes: vec![known_block_hash],
+        locator_hashes,
         stop_hash: bitcoin::BlockHash::GENESIS_PREVIOUS_BLOCK_HASH,
     })
 }
@@ -242,12 +274,12 @@ pub fn process_message(
                         );
                     }
                     // Queue empty (already caught up). Fall back to inv-based sync.
-                    let tip_hash = node_state.get_tip_state().block_hash;
-                    return (PeerStateMachine::AwaitingInv, vec![create_getblocks_message(tip_hash)]);
+                    let locator = build_block_locator(&node_state.chainman);
+                    return (PeerStateMachine::AwaitingInv, vec![create_getblocks_message(locator)]);
                 }
 
-                let best_hash = BlockHash::from_byte_array(node_state.chainman.best_entry().unwrap().block_hash().to_bytes());
-                (PeerStateMachine::AwaitingHeaders, vec![create_getheaders_message(best_hash)])
+                let locator = build_block_locator(&node_state.chainman);
+                (PeerStateMachine::AwaitingHeaders, vec![create_getheaders_message(locator)])
             }
             message => {
                 debug!("Ignoring message: {:?}", message);
@@ -289,10 +321,10 @@ pub fn process_message(
                         )
                     } else {
                         // All blocks already claimed by other peers.
-                        // Re-request from current tip; network round-trip
+                        // Re-request with locator; network round-trip
                         // gives other peers time to finish.
-                        let our_best = node_state.get_tip_state().block_hash;
-                        (PeerStateMachine::AwaitingInv, vec![create_getblocks_message(our_best)])
+                        let locator = build_block_locator(&node_state.chainman);
+                        (PeerStateMachine::AwaitingInv, vec![create_getblocks_message(locator)])
                     }
                 } else {
                     (PeerStateMachine::AwaitingInv, vec![])
@@ -345,10 +377,10 @@ pub fn process_message(
                         )
                     } else {
                         // Queue exhausted. Fall back to inv-based sync.
-                        let our_best = node_state.get_tip_state().block_hash;
+                        let locator = build_block_locator(&node_state.chainman);
                         (
                             PeerStateMachine::AwaitingInv,
-                            vec![create_getblocks_message(our_best)],
+                            vec![create_getblocks_message(locator)],
                         )
                     }
                 } else {
@@ -398,8 +430,8 @@ impl BitcoinPeer {
         let addr = Address::new(&socket_addr, ServiceFlags::WITNESS);
         info!("Connected to {:?}", addr);
         let state_machine = PeerStateMachine::AwaitingHeaders;
-        let best_hash = BlockHash::from_byte_array(node_state.chainman.best_entry().unwrap().block_hash().to_bytes());
-        let getheaders = create_getheaders_message(best_hash);
+        let locator = build_block_locator(&node_state.chainman);
+        let getheaders = create_getheaders_message(locator);
         debug!("sending headers message...");
         writer.send_message(getheaders)?;
         let peer = BitcoinPeer {
@@ -790,12 +822,13 @@ mod tests {
 
     #[test]
     fn create_getheaders_uses_protocol_version() {
-        let msg = create_getheaders_message(hash(1));
+        let msg = create_getheaders_message(vec![hash(1), hash(2)]);
         match msg {
             NetworkMessage::GetHeaders(gh) => {
                 assert_eq!(gh.version, PROTOCOL_VERSION);
-                assert_eq!(gh.locator_hashes.len(), 1);
+                assert_eq!(gh.locator_hashes.len(), 2);
                 assert_eq!(gh.locator_hashes[0], hash(1));
+                assert_eq!(gh.locator_hashes[1], hash(2));
             }
             _ => panic!("expected GetHeaders message"),
         }
@@ -859,12 +892,13 @@ mod tests {
 
     #[test]
     fn create_getblocks_uses_protocol_version() {
-        let msg = create_getblocks_message(hash(1));
+        let msg = create_getblocks_message(vec![hash(1), hash(2)]);
         match msg {
             NetworkMessage::GetBlocks(gb) => {
                 assert_eq!(gb.version, PROTOCOL_VERSION);
-                assert_eq!(gb.locator_hashes.len(), 1);
+                assert_eq!(gb.locator_hashes.len(), 2);
                 assert_eq!(gb.locator_hashes[0], hash(1));
+                assert_eq!(gb.locator_hashes[1], hash(2));
             }
             _ => panic!("expected GetBlocks message"),
         }
