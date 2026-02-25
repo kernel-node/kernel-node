@@ -424,13 +424,24 @@ impl BitcoinPeer {
     }
 
     /// Release any block hashes this peer claimed but never received.
-    /// Called when the peer disconnects to unblock other peers.
-    pub fn release_in_flight(&self, in_flight: &Mutex<HashSet<BlockHash>>) {
+    /// Removes them from the in-flight set and pushes them back to
+    /// the front of the download queue so other peers can pick them up.
+    pub fn release_in_flight(
+        &self,
+        queue: &Mutex<VecDeque<BlockHash>>,
+        in_flight: &Mutex<HashSet<BlockHash>>,
+    ) {
         if let PeerStateMachine::AwaitingBlock(ref state) = self.state_machine {
+            if state.peer_inventory.is_empty() {
+                return;
+            }
+            let mut q = queue.lock().unwrap();
             let mut set = in_flight.lock().unwrap();
             for hash in &state.peer_inventory {
                 set.remove(hash);
+                q.push_front(*hash);
             }
+            debug!("Re-enqueued {} unreceived blocks", state.peer_inventory.len());
         }
     }
 
@@ -630,8 +641,9 @@ impl PeerManager {
                             break;
                         }
                     }
-                    // Release any blocks this peer claimed but never received.
-                    peer.release_in_flight(&node_state.in_flight_blocks);
+                    // Return any blocks this peer claimed but never received
+                    // to the download queue so other peers can pick them up.
+                    peer.release_in_flight(&node_state.download_queue, &node_state.in_flight_blocks);
                     // Remove from connected set and clear writer.
                     connected_peers.lock().unwrap().remove(&socket_addr);
                     let mut w = writer_slot_clone.lock().unwrap();
@@ -787,6 +799,62 @@ mod tests {
             }
             _ => panic!("expected GetHeaders message"),
         }
+    }
+
+    // --- release_in_flight tests ---
+
+    #[test]
+    fn release_returns_blocks_to_queue_front() {
+        // Simulate what release_in_flight does: remove from in_flight,
+        // push to front of queue.
+        let queue = Mutex::new(VecDeque::from(vec![hash(5), hash(6)]));
+        let in_flight = Mutex::new(HashSet::from([hash(1), hash(2), hash(3)]));
+
+        // Simulate peer disconnect with unreceived blocks hash(1), hash(2)
+        let unreceived = vec![hash(1), hash(2)];
+        {
+            let mut q = queue.lock().unwrap();
+            let mut set = in_flight.lock().unwrap();
+            for h in &unreceived {
+                set.remove(h);
+                q.push_front(*h);
+            }
+        }
+
+        // Unreceived blocks should be at the front of the queue
+        let q = queue.lock().unwrap();
+        assert_eq!(q.len(), 4);
+        // push_front inserts in reverse order, so hash(2) then hash(1)
+        assert!(q.contains(&hash(1)));
+        assert!(q.contains(&hash(2)));
+        assert!(q.contains(&hash(5)));
+        assert!(q.contains(&hash(6)));
+
+        // Only hash(3) should remain in-flight
+        let set = in_flight.lock().unwrap();
+        assert!(!set.contains(&hash(1)));
+        assert!(!set.contains(&hash(2)));
+        assert!(set.contains(&hash(3)));
+    }
+
+    #[test]
+    fn released_blocks_can_be_repopped() {
+        let queue = Mutex::new(VecDeque::from(vec![hash(5)]));
+        let in_flight = Mutex::new(HashSet::from([hash(1)]));
+
+        // Simulate disconnect: return hash(1) to queue
+        {
+            let mut q = queue.lock().unwrap();
+            let mut set = in_flight.lock().unwrap();
+            set.remove(&hash(1));
+            q.push_front(hash(1));
+        }
+
+        // Now pop_download_batch should pick up hash(1) again
+        let batch = pop_download_batch(&queue, &in_flight, 16);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0], hash(1));
+        assert_eq!(batch[1], hash(5));
     }
 
     #[test]
