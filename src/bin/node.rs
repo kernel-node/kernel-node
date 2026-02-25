@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::DerefMut,
     sync::{
@@ -330,6 +330,7 @@ fn main() {
         chainman,
         context: Arc::clone(&context),
         in_flight_blocks: Mutex::new(HashSet::new()),
+        download_queue: Mutex::new(VecDeque::new()),
     });
 
     if let Err(err) = node_state.chainman.import_blocks() {

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     net::SocketAddr,
     ops::DerefMut,
@@ -29,6 +29,65 @@ use crate::kernel_util::{bitcoin_block_to_kernel_block, bitcoin_header_to_kernel
 
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::INVALID_CB_NO_BAN_VERSION;
 
+/// Number of blocks each peer requests per batch from the download queue.
+const DOWNLOAD_BATCH_SIZE: usize = 16;
+
+/// Walk backwards from the header tip to the active chain tip, collecting
+/// block hashes into the download queue. Only populates if the queue is empty.
+fn populate_download_queue(chainman: &ChainstateManager, queue: &Mutex<VecDeque<BlockHash>>) {
+    let mut q = queue.lock().unwrap();
+    if !q.is_empty() {
+        return;
+    }
+    let active_height = chainman.active_chain().height();
+    let best = match chainman.best_entry() {
+        Some(entry) => entry,
+        None => return,
+    };
+    let best_height = best.height();
+    if best_height <= active_height {
+        return;
+    }
+    let count = (best_height - active_height) as usize;
+    let mut hashes = Vec::with_capacity(count);
+    let mut current = best;
+    while current.height() > active_height {
+        let hash = BlockHash::from_byte_array(current.block_hash().to_bytes());
+        hashes.push(hash);
+        match current.prev() {
+            Some(prev) => current = prev,
+            None => break,
+        }
+    }
+    hashes.reverse();
+    info!("Built download queue with {} blocks (heights {} to {})", hashes.len(), active_height + 1, best_height);
+    *q = VecDeque::from(hashes);
+}
+
+/// Pop up to `batch_size` block hashes from the download queue and mark
+/// them as in-flight. Always locks queue first, then in_flight.
+fn pop_download_batch(
+    queue: &Mutex<VecDeque<BlockHash>>,
+    in_flight: &Mutex<HashSet<BlockHash>>,
+    batch_size: usize,
+) -> Vec<BlockHash> {
+    let mut q = queue.lock().unwrap();
+    let mut in_flight = in_flight.lock().unwrap();
+    let mut batch = Vec::with_capacity(batch_size);
+    while batch.len() < batch_size {
+        match q.pop_front() {
+            Some(hash) => {
+                if !in_flight.contains(&hash) {
+                    in_flight.insert(hash);
+                    batch.push(hash);
+                }
+            }
+            None => break,
+        }
+    }
+    batch
+}
+
 #[derive(Clone)]
 pub struct TipState {
     pub block_hash: bitcoin::BlockHash,
@@ -52,6 +111,9 @@ pub struct NodeState {
     /// Peers claim hashes when requesting blocks and release them
     /// on receipt or disconnect.
     pub in_flight_blocks: Mutex<HashSet<BlockHash>>,
+    /// Pre-built queue of block hashes to download, populated after
+    /// header sync by walking backwards from the header tip.
+    pub download_queue: Mutex<VecDeque<BlockHash>>,
 }
 
 impl NodeState {
@@ -69,19 +131,20 @@ impl NodeState {
 /// State Machine for setting up a connection and getting blocks from a peer
 ///
 /// ```text
-///       [*]
-///        │
-/// AwaitingHeaders
-///        ▼
-///   AwaitingInv
-///       ▲ |
-/// Block | | Inv
-///       | ▼
-///   AwaitingBlock
-///       │ ▲
-///       │ │
-///       └─┘
-///      Block
+///          [*]
+///           │
+///    AwaitingHeaders
+///      /          \
+///  (queue)     (no queue)
+///    /              \
+/// AwaitingBlock  AwaitingInv
+///    │  ▲           ▲ |
+///    │  │     Block | | Inv
+///    └──┘           | ▼
+///  (next batch)  AwaitingBlock
+///    │               │ ▲
+///    │ (queue empty)  └─┘
+///    └──> AwaitingInv
 /// ```
 #[derive(Default)]
 pub enum PeerStateMachine {
@@ -157,6 +220,24 @@ pub fn process_message(
                 }
 
                 if headers.0.len() != 2000 {
+                    // Headers sync complete. Build the download queue from
+                    // the header chain and start downloading directly.
+                    populate_download_queue(&node_state.chainman, &node_state.download_queue);
+                    let batch = pop_download_batch(
+                        &node_state.download_queue,
+                        &node_state.in_flight_blocks,
+                        DOWNLOAD_BATCH_SIZE,
+                    );
+                    if !batch.is_empty() {
+                        return (
+                            PeerStateMachine::AwaitingBlock(AwaitingBlock {
+                                peer_inventory: batch.iter().cloned().collect(),
+                                block_buffer: HashMap::new(),
+                            }),
+                            vec![create_getdata_message(&batch)],
+                        );
+                    }
+                    // Queue empty (already caught up). Fall back to inv-based sync.
                     let tip_hash = node_state.get_tip_state().block_hash;
                     return (PeerStateMachine::AwaitingInv, vec![create_getblocks_message(tip_hash)]);
                 }
@@ -240,16 +321,32 @@ pub fn process_message(
                     }
                 }
 
-                // If all to be expected blocks were received, clear any
-                // remaining blocks in the buffer and request a fresh batch of
-                // blocks.
+                // If all expected blocks were received, clear any remaining
+                // blocks in the buffer and request the next batch.
                 if block_state.peer_inventory.is_empty() {
                     block_state.block_buffer.clear();
-                    let our_best = node_state.get_tip_state().block_hash;
-                    (
-                        PeerStateMachine::AwaitingInv,
-                        vec![create_getblocks_message(our_best)],
-                    )
+                    // Try to get the next batch from the download queue.
+                    let batch = pop_download_batch(
+                        &node_state.download_queue,
+                        &node_state.in_flight_blocks,
+                        DOWNLOAD_BATCH_SIZE,
+                    );
+                    if !batch.is_empty() {
+                        (
+                            PeerStateMachine::AwaitingBlock(AwaitingBlock {
+                                peer_inventory: batch.iter().cloned().collect(),
+                                block_buffer: HashMap::new(),
+                            }),
+                            vec![create_getdata_message(&batch)],
+                        )
+                    } else {
+                        // Queue exhausted. Fall back to inv-based sync.
+                        let our_best = node_state.get_tip_state().block_hash;
+                        (
+                            PeerStateMachine::AwaitingInv,
+                            vec![create_getblocks_message(our_best)],
+                        )
+                    }
                 } else {
                     (PeerStateMachine::AwaitingBlock(block_state), vec![])
                 }
