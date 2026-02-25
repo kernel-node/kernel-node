@@ -903,4 +903,87 @@ mod tests {
             _ => panic!("expected GetBlocks message"),
         }
     }
+
+    // --- Additional message construction tests ---
+
+    #[test]
+    fn create_getdata_message_all_items_are_witness_block() {
+        let hashes = vec![hash(1), hash(2), hash(3)];
+        let msg = create_getdata_message(&hashes);
+        match msg {
+            NetworkMessage::GetData(payload) => {
+                for (i, inv) in payload.0.iter().enumerate() {
+                    assert!(
+                        matches!(inv, Inventory::WitnessBlock(_)),
+                        "item {} should be WitnessBlock, got {:?}", i, inv
+                    );
+                }
+            }
+            _ => panic!("expected GetData message"),
+        }
+    }
+
+    #[test]
+    fn create_getdata_message_empty_input() {
+        let msg = create_getdata_message(&[]);
+        match msg {
+            NetworkMessage::GetData(payload) => {
+                assert!(payload.0.is_empty());
+            }
+            _ => panic!("expected GetData message"),
+        }
+    }
+
+    #[test]
+    fn create_getheaders_stop_hash_is_genesis() {
+        let msg = create_getheaders_message(vec![hash(1)]);
+        match msg {
+            NetworkMessage::GetHeaders(gh) => {
+                assert_eq!(gh.stop_hash, BlockHash::GENESIS_PREVIOUS_BLOCK_HASH);
+            }
+            _ => panic!("expected GetHeaders message"),
+        }
+    }
+
+    #[test]
+    fn create_getblocks_stop_hash_is_genesis() {
+        let msg = create_getblocks_message(vec![hash(1)]);
+        match msg {
+            NetworkMessage::GetBlocks(gb) => {
+                assert_eq!(gb.stop_hash, BlockHash::GENESIS_PREVIOUS_BLOCK_HASH);
+            }
+            _ => panic!("expected GetBlocks message"),
+        }
+    }
+
+    // --- Additional pop_download_batch tests ---
+
+    #[test]
+    fn pop_download_batch_zero_batch_size() {
+        let queue = Mutex::new(VecDeque::from(vec![hash(1), hash(2)]));
+        let in_flight = Mutex::new(HashSet::new());
+        let batch = pop_download_batch(&queue, &in_flight, 0);
+        assert!(batch.is_empty());
+        // Queue should be untouched
+        assert_eq!(queue.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pop_download_batch_preserves_fifo_order() {
+        let queue = Mutex::new(VecDeque::from(vec![hash(1), hash(2), hash(3), hash(4), hash(5)]));
+        let in_flight = Mutex::new(HashSet::new());
+        let batch = pop_download_batch(&queue, &in_flight, 5);
+        assert_eq!(batch, vec![hash(1), hash(2), hash(3), hash(4), hash(5)]);
+    }
+
+    // --- TipState tests ---
+
+    #[test]
+    fn tip_state_clone_is_independent() {
+        let original = TipState { block_hash: hash(1) };
+        let mut cloned = original.clone();
+        cloned.block_hash = hash(2);
+        assert_eq!(original.block_hash, hash(1));
+        assert_eq!(cloned.block_hash, hash(2));
+    }
 }
