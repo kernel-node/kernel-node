@@ -195,7 +195,7 @@ pub fn process_message(
 ) -> (PeerStateMachine, Vec<NetworkMessage>) {
     // Always process the ping first as a special case.
     if let NetworkMessage::Ping(nonce) = event {
-        info!("Received ping, responding pong.");
+        debug!("Received ping, responding pong.");
         return (state_machine, vec![NetworkMessage::Pong(nonce)]);
     }
 
