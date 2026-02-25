@@ -79,7 +79,6 @@ fn create_context(
                     shutdown_tx_clone.send(()).expect("failed to send shutdown signal");
                 }
         })
-        // .with_block_checked_validation(setup_validation_interface(tip_state))
         .with_block_checked_validation(move |block: bitcoinkernel::Block, state: bitcoinkernel::BlockValidationStateRef<'_>| {
             match state.mode() {
                 ValidationMode::Valid => {
@@ -113,22 +112,6 @@ fn setup_logging() {
 
     unsafe { GLOBAL_LOG_CALLBACK_HOLDER = Some(Logger::new(KernelLog {}).unwrap()) };
 }
-
-// fn setup_validation_interface(
-//     tip_state: &Arc<Mutex<TipState>>,
-// ) -> Box<ValidationInterfaceCallbacks> {
-//     let tip_state_clone = Arc::clone(&tip_state);
-//     Box::new(ValidationInterfaceCallbacks {
-//         block_checked: Box::new(move |block, mode, _result| match mode {
-//             ValidationMode::Valid => {
-//                 let hash = bitcoin::BlockHash::from_byte_array(block.get_hash().hash);
-//                 log::debug!("Validation interface: Successfully checked block: {}", hash);
-//                 tip_state_clone.lock().unwrap().block_hash = hash;
-//             }
-//             _ => error!("Received an invalid block!"),
-//         }),
-//     })
-// }
 
 fn resolve_seeds(network: Network) -> Vec<IpAddr> {
     let rt = tokio::runtime::Builder::new_current_thread()
