@@ -14,7 +14,7 @@ use std::{
 use bitcoin::{BlockHash, Network, TestnetVersion};
 use bitcoinkernel::{
     core::BlockHashExt, prelude::BlockValidationStateExt, ChainType, ChainstateManagerBuilder,
-    Context, ContextBuilder, Log, Logger, SynchronizationState, ValidationMode,
+    Context, ContextBuilder, Log, Logger, ProcessBlockResult, SynchronizationState, ValidationMode,
 };
 use kernel_node::peer::{NodeState, PeerManager, TipState};
 use kernel_node::{
@@ -245,7 +245,17 @@ fn run(
                 Ok(block) => {
                     debug!("Validating block.");
                     last_block = Instant::now();
-                    let _ = chainman.process_block(&block);
+                    match chainman.process_block(&block) {
+                        ProcessBlockResult::NewBlock => {}
+                        ProcessBlockResult::Duplicate => {
+                            debug!("Received duplicate block, skipping.");
+                            continue;
+                        }
+                        ProcessBlockResult::Rejected => {
+                            warn!("Block rejected by validation.");
+                            continue;
+                        }
+                    }
                     blocks_since_log += 1;
                     if last_log.elapsed() >= Duration::from_secs(10) {
                         let height = chainman.active_chain().height();
