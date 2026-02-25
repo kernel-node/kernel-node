@@ -147,6 +147,7 @@ fn resolve_seeds(network: Network) -> Vec<IpAddr> {
 fn run(
     network: Network,
     connect: Option<SocketAddr>,
+    maxpeers: usize,
     node_state: Arc<NodeState>,
     shutdown_rx: mpsc::Receiver<()>,
     addr_rx: mpsc::Receiver<AddrV2Payload>,
@@ -197,7 +198,8 @@ fn run(
     let chainman = Arc::clone(&node_state.chainman);
     let context = Arc::clone(&node_state.context);
 
-    let mut peer_manager = PeerManager::new(table, Arc::clone(&node_state), network);
+    let mut peer_manager = PeerManager::new(table, Arc::clone(&node_state), network)
+        .max_peers(maxpeers);
     let peer_manager_addrman = Arc::clone(peer_manager.addrman());
     let running_block = peer_manager.running();
 
@@ -369,5 +371,5 @@ fn main() {
         })
     });
 
-    run(network, connect, node_state, shutdown_rx, addr_rx, block_rx).unwrap()
+    run(network, connect, config.maxpeers, node_state, shutdown_rx, addr_rx, block_rx).unwrap()
 }
