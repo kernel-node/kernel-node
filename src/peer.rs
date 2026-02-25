@@ -662,3 +662,143 @@ impl PeerManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash(n: u8) -> BlockHash {
+        BlockHash::from_byte_array([n; 32])
+    }
+
+    // --- pop_download_batch tests ---
+
+    #[test]
+    fn pop_download_batch_returns_requested_count() {
+        let queue = Mutex::new(VecDeque::from(vec![hash(1), hash(2), hash(3), hash(4)]));
+        let in_flight = Mutex::new(HashSet::new());
+        let batch = pop_download_batch(&queue, &in_flight, 2);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0], hash(1));
+        assert_eq!(batch[1], hash(2));
+        // Remaining in queue
+        assert_eq!(queue.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pop_download_batch_marks_in_flight() {
+        let queue = Mutex::new(VecDeque::from(vec![hash(1), hash(2)]));
+        let in_flight = Mutex::new(HashSet::new());
+        pop_download_batch(&queue, &in_flight, 2);
+        let set = in_flight.lock().unwrap();
+        assert!(set.contains(&hash(1)));
+        assert!(set.contains(&hash(2)));
+    }
+
+    #[test]
+    fn pop_download_batch_skips_already_in_flight() {
+        let queue = Mutex::new(VecDeque::from(vec![hash(1), hash(2), hash(3)]));
+        let in_flight = Mutex::new(HashSet::from([hash(2)]));
+        let batch = pop_download_batch(&queue, &in_flight, 3);
+        // hash(2) was already in-flight, so it's skipped (but still popped from queue)
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0], hash(1));
+        assert_eq!(batch[1], hash(3));
+    }
+
+    #[test]
+    fn pop_download_batch_returns_partial_when_queue_short() {
+        let queue = Mutex::new(VecDeque::from(vec![hash(1)]));
+        let in_flight = Mutex::new(HashSet::new());
+        let batch = pop_download_batch(&queue, &in_flight, 16);
+        assert_eq!(batch.len(), 1);
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pop_download_batch_returns_empty_when_queue_empty() {
+        let queue = Mutex::new(VecDeque::new());
+        let in_flight = Mutex::new(HashSet::new());
+        let batch = pop_download_batch(&queue, &in_flight, 16);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn pop_download_batch_returns_empty_when_all_in_flight() {
+        let queue = Mutex::new(VecDeque::from(vec![hash(1), hash(2)]));
+        let in_flight = Mutex::new(HashSet::from([hash(1), hash(2)]));
+        let batch = pop_download_batch(&queue, &in_flight, 16);
+        assert!(batch.is_empty());
+        // Queue should be drained even though nothing was claimed
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pop_download_batch_multiple_calls_drain_queue() {
+        let queue = Mutex::new(VecDeque::from(vec![hash(1), hash(2), hash(3), hash(4)]));
+        let in_flight = Mutex::new(HashSet::new());
+        let batch1 = pop_download_batch(&queue, &in_flight, 2);
+        let batch2 = pop_download_batch(&queue, &in_flight, 2);
+        let batch3 = pop_download_batch(&queue, &in_flight, 2);
+        assert_eq!(batch1, vec![hash(1), hash(2)]);
+        assert_eq!(batch2, vec![hash(3), hash(4)]);
+        assert!(batch3.is_empty());
+    }
+
+    // --- TipState tests ---
+
+    #[test]
+    fn tip_state_default_is_genesis() {
+        let state = TipState::default();
+        assert_eq!(state.block_hash, BlockHash::GENESIS_PREVIOUS_BLOCK_HASH);
+    }
+
+    // --- PeerStateMachine tests ---
+
+    #[test]
+    fn peer_state_machine_default_is_awaiting_headers() {
+        let state = PeerStateMachine::default();
+        assert!(matches!(state, PeerStateMachine::AwaitingHeaders));
+    }
+
+    // --- Message construction tests ---
+
+    #[test]
+    fn create_getdata_message_wraps_as_witness_block() {
+        let hashes = vec![hash(1), hash(2)];
+        let msg = create_getdata_message(&hashes);
+        match msg {
+            NetworkMessage::GetData(payload) => {
+                assert_eq!(payload.0.len(), 2);
+                assert!(matches!(payload.0[0], Inventory::WitnessBlock(_)));
+            }
+            _ => panic!("expected GetData message"),
+        }
+    }
+
+    #[test]
+    fn create_getheaders_uses_protocol_version() {
+        let msg = create_getheaders_message(hash(1));
+        match msg {
+            NetworkMessage::GetHeaders(gh) => {
+                assert_eq!(gh.version, PROTOCOL_VERSION);
+                assert_eq!(gh.locator_hashes.len(), 1);
+                assert_eq!(gh.locator_hashes[0], hash(1));
+            }
+            _ => panic!("expected GetHeaders message"),
+        }
+    }
+
+    #[test]
+    fn create_getblocks_uses_protocol_version() {
+        let msg = create_getblocks_message(hash(1));
+        match msg {
+            NetworkMessage::GetBlocks(gb) => {
+                assert_eq!(gb.version, PROTOCOL_VERSION);
+                assert_eq!(gb.locator_hashes.len(), 1);
+                assert_eq!(gb.locator_hashes[0], hash(1));
+            }
+            _ => panic!("expected GetBlocks message"),
+        }
+    }
+}
