@@ -8,7 +8,7 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bitcoin::{BlockHash, Network};
@@ -31,6 +31,10 @@ const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::INVALID_CB_NO_BAN_VER
 
 /// Number of blocks each peer requests per batch from the download queue.
 const DOWNLOAD_BATCH_SIZE: usize = 16;
+
+/// If a peer stays in AwaitingBlock for this long without receiving any
+/// block, it is considered stalled and disconnected.
+const PEER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Walk backwards from the header tip to the active chain tip, collecting
 /// block hashes into the download queue. Only populates if the queue is empty.
@@ -364,6 +368,9 @@ pub struct BitcoinPeer {
     writer: Arc<ConnectionWriter>,
     reader: ConnectionReader,
     state_machine: PeerStateMachine,
+    /// Tracks when this peer last made progress (received a block or
+    /// changed state). Used to detect stalled peers.
+    last_progress: Instant,
 }
 
 impl fmt::Display for BitcoinPeer {
@@ -400,6 +407,7 @@ impl BitcoinPeer {
             writer: Arc::new(writer),
             reader,
             state_machine,
+            last_progress: Instant::now(),
         };
         Ok(peer)
     }
@@ -426,14 +434,28 @@ impl BitcoinPeer {
         }
     }
 
+    /// Returns true if this peer is in AwaitingBlock state and has not
+    /// made progress (received a block) within PEER_STALL_TIMEOUT.
+    pub fn is_stalled(&self) -> bool {
+        matches!(self.state_machine, PeerStateMachine::AwaitingBlock(_))
+            && self.last_progress.elapsed() > PEER_STALL_TIMEOUT
+    }
+
     pub fn receive_and_process_message(
         &mut self,
         node_state: &NodeState,
     ) -> Result<(), p2p::net::Error> {
         let msg = self.receive_message()?;
+        // A block message means the peer is making progress.
+        let is_block = matches!(msg, NetworkMessage::Block(_));
         let old_state = std::mem::take(&mut self.state_machine);
         let (peer_state_machine, mut messages) = process_message(old_state, msg, node_state);
         self.state_machine = peer_state_machine;
+
+        if is_block {
+            self.last_progress = Instant::now();
+        }
+
         for message in messages.drain(..) {
             self.writer.send_message(message)?
         }
@@ -590,6 +612,10 @@ impl PeerManager {
                     info!("Peer thread {}: connected to {}", i, peer);
                     loop {
                         if !running.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if peer.is_stalled() {
+                            warn!("Peer thread {}: stalled waiting for blocks, disconnecting {}", i, peer);
                             break;
                         }
                         if let Err(e) = peer.receive_and_process_message(&node_state) {
