@@ -12,16 +12,20 @@ use std::{
 };
 
 use bitcoin::{BlockHash, Network};
-use bitcoinkernel::{ChainstateManager, Context, ProcessBlockHeaderResult, ValidationMode, core::BlockHashExt, prelude::BlockValidationStateExt};
+use bitcoinkernel::{
+    core::BlockHashExt, prelude::BlockValidationStateExt, ChainstateManager, Context,
+    ProcessBlockHeaderResult, ValidationMode,
+};
 use log::{debug, error, info, warn};
 use p2p::{
     handshake::ConnectionConfig,
     net::{ConnectionExt, ConnectionReader, ConnectionWriter, TimeoutParams},
     p2p_message_types::{
-        address::AddrV2, Address, ProtocolVersion, ServiceFlags,
+        address::AddrV2,
         message::{AddrV2Payload, InventoryPayload, NetworkMessage},
         message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory},
         message_network::UserAgent,
+        Address, ProtocolVersion, ServiceFlags,
     },
 };
 
@@ -64,7 +68,12 @@ fn populate_download_queue(chainman: &ChainstateManager, queue: &Mutex<VecDeque<
         }
     }
     hashes.reverse();
-    info!("Built download queue with {} blocks (heights {} to {})", hashes.len(), active_height + 1, best_height);
+    info!(
+        "Built download queue with {} blocks (heights {} to {})",
+        hashes.len(),
+        active_height + 1,
+        best_height
+    );
     *q = VecDeque::from(hashes);
 }
 
@@ -245,9 +254,13 @@ pub fn process_message(
         PeerStateMachine::AwaitingHeaders => match event {
             NetworkMessage::Headers(headers) => {
                 for header in &headers.0 {
-                    let result = node_state.chainman.process_block_header(&bitcoin_header_to_kernel_header(&header));
+                    let result = node_state
+                        .chainman
+                        .process_block_header(&bitcoin_header_to_kernel_header(&header));
                     match result {
-                        ProcessBlockHeaderResult::Success(state) if state.mode() == ValidationMode::Valid => {
+                        ProcessBlockHeaderResult::Success(state)
+                            if state.mode() == ValidationMode::Valid =>
+                        {
                             debug!("Processed header: {}", header.time.to_u32());
                             continue;
                         }
@@ -276,17 +289,23 @@ pub fn process_message(
                         );
                     }
                     let locator = build_block_locator(&node_state.chainman);
-                    return (PeerStateMachine::AwaitingInv, vec![create_getblocks_message(locator)]);
+                    return (
+                        PeerStateMachine::AwaitingInv,
+                        vec![create_getblocks_message(locator)],
+                    );
                 }
 
                 let locator = build_block_locator(&node_state.chainman);
-                (PeerStateMachine::AwaitingHeaders, vec![create_getheaders_message(locator)])
+                (
+                    PeerStateMachine::AwaitingHeaders,
+                    vec![create_getheaders_message(locator)],
+                )
             }
             message => {
                 debug!("Ignoring message: {:?}", message);
                 (PeerStateMachine::AwaitingHeaders, vec![])
             }
-        }
+        },
         PeerStateMachine::AwaitingInv => match event {
             NetworkMessage::Inv(inventory) => {
                 debug!("Received inventory with {} items", inventory.0.len());
@@ -321,7 +340,10 @@ pub fn process_message(
                         )
                     } else {
                         let locator = build_block_locator(&node_state.chainman);
-                        (PeerStateMachine::AwaitingInv, vec![create_getblocks_message(locator)])
+                        (
+                            PeerStateMachine::AwaitingInv,
+                            vec![create_getblocks_message(locator)],
+                        )
                     }
                 } else {
                     (PeerStateMachine::AwaitingInv, vec![])
@@ -338,7 +360,11 @@ pub fn process_message(
                 let block_hash = block.block_hash();
                 let prev_blockhash = block.header().prev_blockhash;
                 block_state.peer_inventory.remove(&block_hash);
-                node_state.in_flight_blocks.lock().unwrap().remove(&block_hash);
+                node_state
+                    .in_flight_blocks
+                    .lock()
+                    .unwrap()
+                    .remove(&block_hash);
                 block_state
                     .block_buffer
                     .insert(prev_blockhash, bitcoin_block_to_kernel_block(&block));
@@ -492,7 +518,10 @@ impl BitcoinPeer {
                 set.remove(hash);
                 q.push_front(*hash);
             }
-            debug!("Re-enqueued {} unreceived blocks", state.peer_inventory.len());
+            debug!(
+                "Re-enqueued {} unreceived blocks",
+                state.peer_inventory.len()
+            );
         }
     }
 
@@ -614,8 +643,7 @@ impl PeerManager {
             let addrman = Arc::clone(&self.addrman);
             let node_state = Arc::clone(&self.node_state);
             let network = self.network;
-            let writer_slot: Arc<Mutex<Option<Arc<ConnectionWriter>>>> =
-                Arc::new(Mutex::new(None));
+            let writer_slot: Arc<Mutex<Option<Arc<ConnectionWriter>>>> = Arc::new(Mutex::new(None));
             let writer_slot_clone = Arc::clone(&writer_slot);
             self.peer_writers.push(writer_slot);
 
@@ -638,9 +666,7 @@ impl PeerManager {
                             AddrV2::Ipv4(ipv4) => {
                                 SocketAddr::V4(std::net::SocketAddrV4::new(ipv4, port))
                             }
-                            AddrV2::Ipv6(ipv6) => {
-                                SocketAddr::from((ipv6, port))
-                            }
+                            AddrV2::Ipv6(ipv6) => SocketAddr::from((ipv6, port)),
                             _ => continue,
                         }
                     };
@@ -648,7 +674,10 @@ impl PeerManager {
                     {
                         let mut peers = connected_peers.lock().unwrap();
                         if peers.contains(&socket_addr) {
-                            debug!("Peer thread {}: skipping {} (already connected)", i, socket_addr);
+                            debug!(
+                                "Peer thread {}: skipping {} (already connected)",
+                                i, socket_addr
+                            );
                             continue;
                         }
                         peers.insert(socket_addr);
@@ -662,7 +691,10 @@ impl PeerManager {
                             connection
                         }
                         Err(e) => {
-                            error!("Peer thread {}: could not connect to {}: {}", i, socket_addr, e);
+                            error!(
+                                "Peer thread {}: could not connect to {}: {}",
+                                i, socket_addr, e
+                            );
                             connected_peers.lock().unwrap().remove(&socket_addr);
                             thread::sleep(Duration::from_millis(500));
                             continue;
@@ -675,7 +707,10 @@ impl PeerManager {
                             break;
                         }
                         if peer.is_stalled() {
-                            warn!("Peer thread {}: stalled waiting for blocks, disconnecting {}", i, peer);
+                            warn!(
+                                "Peer thread {}: stalled waiting for blocks, disconnecting {}",
+                                i, peer
+                            );
                             break;
                         }
                         if let Err(e) = peer.receive_and_process_message(&node_state) {
@@ -690,7 +725,10 @@ impl PeerManager {
                             break;
                         }
                     }
-                    peer.release_in_flight(&node_state.download_queue, &node_state.in_flight_blocks);
+                    peer.release_in_flight(
+                        &node_state.download_queue,
+                        &node_state.in_flight_blocks,
+                    );
                     connected_peers.lock().unwrap().remove(&socket_addr);
                     let mut w = writer_slot_clone.lock().unwrap();
                     *w = None;
@@ -900,7 +938,9 @@ mod tests {
                 for (i, inv) in payload.0.iter().enumerate() {
                     assert!(
                         matches!(inv, Inventory::WitnessBlock(_)),
-                        "item {} should be WitnessBlock, got {:?}", i, inv
+                        "item {} should be WitnessBlock, got {:?}",
+                        i,
+                        inv
                     );
                 }
             }
@@ -951,14 +991,22 @@ mod tests {
 
     #[test]
     fn pop_download_batch_preserves_fifo_order() {
-        let queue = Mutex::new(VecDeque::from(vec![hash(1), hash(2), hash(3), hash(4), hash(5)]));
+        let queue = Mutex::new(VecDeque::from(vec![
+            hash(1),
+            hash(2),
+            hash(3),
+            hash(4),
+            hash(5),
+        ]));
         let in_flight = Mutex::new(HashSet::new());
         let batch = pop_download_batch(&queue, &in_flight, 5);
         assert_eq!(batch, vec![hash(1), hash(2), hash(3), hash(4), hash(5)]);
     }
     #[test]
     fn tip_state_clone_is_independent() {
-        let original = TipState { block_hash: hash(1) };
+        let original = TipState {
+            block_hash: hash(1),
+        };
         let mut cloned = original.clone();
         cloned.block_hash = hash(2);
         assert_eq!(original.block_hash, hash(1));
@@ -998,9 +1046,8 @@ mod tests {
 
         let (block_tx, _block_rx) = mpsc::sync_channel(32);
         let (addr_tx, _addr_rx) = mpsc::channel();
-        let tip_hash = BlockHash::from_byte_array(
-            chainman.active_chain().tip().block_hash().to_bytes(),
-        );
+        let tip_hash =
+            BlockHash::from_byte_array(chainman.active_chain().tip().block_hash().to_bytes());
 
         let node_state = Arc::new(NodeState {
             addr_tx,
@@ -1095,7 +1142,11 @@ mod tests {
         let genesis_hash = genesis.header().block_hash();
         let inv = NetworkMessage::Inv(InventoryPayload(vec![Inventory::Block(genesis_hash)]));
         let (state, messages) = process_message(state, inv, &node_state);
-        assert!(node_state.in_flight_blocks.lock().unwrap().contains(&genesis_hash));
+        assert!(node_state
+            .in_flight_blocks
+            .lock()
+            .unwrap()
+            .contains(&genesis_hash));
         assert!(matches!(state, PeerStateMachine::AwaitingBlock(_)));
         assert_eq!(messages.len(), 1);
         assert!(matches!(messages[0], NetworkMessage::GetData(_)));

@@ -107,7 +107,8 @@ static START: Once = Once::new();
 static mut GLOBAL_LOG_CALLBACK_HOLDER: Option<Logger> = None;
 
 fn setup_logging() {
-    let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
     builder.init();
 
     unsafe { GLOBAL_LOG_CALLBACK_HOLDER = Some(Logger::new(KernelLog {}).unwrap()) };
@@ -198,8 +199,8 @@ fn run(
     let chainman = Arc::clone(&node_state.chainman);
     let context = Arc::clone(&node_state.context);
 
-    let mut peer_manager = PeerManager::new(table, Arc::clone(&node_state), network)
-        .max_peers(maxpeers);
+    let mut peer_manager =
+        PeerManager::new(table, Arc::clone(&node_state), network).max_peers(maxpeers);
     let peer_manager_addrman = Arc::clone(peer_manager.addrman());
     let running_block = peer_manager.running();
 
@@ -392,5 +393,14 @@ fn main() {
         })
     });
 
-    run(network, connect, config.maxpeers, node_state, shutdown_rx, addr_rx, block_rx).unwrap()
+    run(
+        network,
+        connect,
+        config.maxpeers,
+        node_state,
+        shutdown_rx,
+        addr_rx,
+        block_rx,
+    )
+    .unwrap()
 }
