@@ -271,7 +271,10 @@ fn e2e_sync_regtest_blocks() {
 
     let bitcoind_dir = TempDir::new().expect("failed to create temp dir");
     let bitcoind = BitcoindInstance::start(bitcoind_dir.path().to_str().unwrap());
-    eprintln!("bitcoind started on p2p={} rpc={}", bitcoind.p2p_port, bitcoind.rpc_port);
+    eprintln!(
+        "bitcoind started on p2p={} rpc={}",
+        bitcoind.p2p_port, bitcoind.rpc_port
+    );
 
     bitcoind.cli(&["createwallet", "test"]);
     let address = bitcoind.cli(&["getnewaddress"]);
@@ -285,7 +288,8 @@ fn e2e_sync_regtest_blocks() {
     sync_to(&node, &bitcoind, 150);
 
     assert_eq!(
-        node.height(), 150,
+        node.height(),
+        150,
         "kernel-node should have synced to height 150",
     );
 }
@@ -300,7 +304,10 @@ fn e2e_sync_resume() {
 
     let bitcoind_dir = TempDir::new().expect("failed to create temp dir");
     let bitcoind = BitcoindInstance::start(bitcoind_dir.path().to_str().unwrap());
-    eprintln!("bitcoind started on p2p={} rpc={}", bitcoind.p2p_port, bitcoind.rpc_port);
+    eprintln!(
+        "bitcoind started on p2p={} rpc={}",
+        bitcoind.p2p_port, bitcoind.rpc_port
+    );
 
     bitcoind.cli(&["createwallet", "test"]);
     let address = bitcoind.cli(&["getnewaddress"]);
@@ -321,7 +328,8 @@ fn e2e_sync_resume() {
 
     sync_to(&node, &bitcoind, 100);
     assert_eq!(
-        node.height(), 100,
+        node.height(),
+        100,
         "kernel-node should have resumed and synced to height 100",
     );
     eprintln!("phase 2: synced to height {}", node.height());
@@ -338,7 +346,10 @@ fn e2e_disconnect_and_reconnect() {
     let bitcoind_dir = TempDir::new().expect("failed to create temp dir");
     let datadir = bitcoind_dir.path().to_str().unwrap();
     let bitcoind = BitcoindInstance::start(datadir);
-    eprintln!("bitcoind started on p2p={} rpc={}", bitcoind.p2p_port, bitcoind.rpc_port);
+    eprintln!(
+        "bitcoind started on p2p={} rpc={}",
+        bitcoind.p2p_port, bitcoind.rpc_port
+    );
 
     bitcoind.cli(&["createwallet", "test"]);
     let address = bitcoind.cli(&["getnewaddress"]);
@@ -351,19 +362,26 @@ fn e2e_disconnect_and_reconnect() {
 
     sync_to(&node, &bitcoind, 50);
     let partial_height = node.height();
-    assert!(partial_height >= 1, "should have synced at least 1 block before disconnect");
+    assert!(
+        partial_height >= 1,
+        "should have synced at least 1 block before disconnect"
+    );
     eprintln!("synced to height {} before disconnect", partial_height);
 
     let datadir = bitcoind.stop();
     eprintln!("bitcoind stopped");
 
     let bitcoind2 = BitcoindInstance::start(&datadir);
-    eprintln!("bitcoind restarted on p2p={} rpc={}", bitcoind2.p2p_port, bitcoind2.rpc_port);
+    eprintln!(
+        "bitcoind restarted on p2p={} rpc={}",
+        bitcoind2.p2p_port, bitcoind2.rpc_port
+    );
     assert_eq!(bitcoind2.height(), 150);
 
     sync_to(&node, &bitcoind2, 150);
     assert_eq!(
-        node.height(), 150,
+        node.height(),
+        150,
         "kernel-node should have synced to height 150 after reconnect",
     );
     eprintln!("synced to height {} after reconnect", node.height());
@@ -379,7 +397,10 @@ fn e2e_mine_after_sync() {
 
     let bitcoind_dir = TempDir::new().expect("failed to create temp dir");
     let bitcoind = BitcoindInstance::start(bitcoind_dir.path().to_str().unwrap());
-    eprintln!("bitcoind started on p2p={} rpc={}", bitcoind.p2p_port, bitcoind.rpc_port);
+    eprintln!(
+        "bitcoind started on p2p={} rpc={}",
+        bitcoind.p2p_port, bitcoind.rpc_port
+    );
 
     bitcoind.cli(&["createwallet", "test"]);
     let address = bitcoind.cli(&["getnewaddress"]);
@@ -394,16 +415,15 @@ fn e2e_mine_after_sync() {
     assert_eq!(node.height(), 100, "should have synced to height 100");
     eprintln!("synced to height {}", node.height());
 
-    // Mine more blocks while the node is already synced.
     bitcoind.cli(&["generatetoaddress", "10", &address]);
     assert_eq!(bitcoind.height(), 110);
     eprintln!("mined 10 more blocks (total 110)");
 
     sync_to(&node, &bitcoind, 110);
     assert_eq!(
-        node.height(), 110,
+        node.height(),
+        110,
         "kernel-node should have picked up new blocks via getblocks/inv",
     );
     eprintln!("synced to height {} after new blocks mined", node.height());
 }
-
