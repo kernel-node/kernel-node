@@ -369,3 +369,41 @@ fn e2e_disconnect_and_reconnect() {
     eprintln!("synced to height {} after reconnect", node.height());
 }
 
+#[test]
+#[ignore]
+fn e2e_mine_after_sync() {
+    if !has_bitcoind() {
+        eprintln!("SKIPPED: bitcoind not found in PATH");
+        return;
+    }
+
+    let bitcoind_dir = TempDir::new().expect("failed to create temp dir");
+    let bitcoind = BitcoindInstance::start(bitcoind_dir.path().to_str().unwrap());
+    eprintln!("bitcoind started on p2p={} rpc={}", bitcoind.p2p_port, bitcoind.rpc_port);
+
+    bitcoind.cli(&["createwallet", "test"]);
+    let address = bitcoind.cli(&["getnewaddress"]);
+    bitcoind.cli(&["generatetoaddress", "100", &address]);
+    assert_eq!(bitcoind.height(), 100);
+    eprintln!("mined 100 blocks");
+
+    let node_dir = TempDir::new().expect("failed to create temp dir");
+    let node = KernelNode::new(&node_dir);
+
+    sync_to(&node, &bitcoind, 100);
+    assert_eq!(node.height(), 100, "should have synced to height 100");
+    eprintln!("synced to height {}", node.height());
+
+    // Mine more blocks while the node is already synced.
+    bitcoind.cli(&["generatetoaddress", "10", &address]);
+    assert_eq!(bitcoind.height(), 110);
+    eprintln!("mined 10 more blocks (total 110)");
+
+    sync_to(&node, &bitcoind, 110);
+    assert_eq!(
+        node.height(), 110,
+        "kernel-node should have picked up new blocks via getblocks/inv",
+    );
+    eprintln!("synced to height {} after new blocks mined", node.height());
+}
+
