@@ -422,6 +422,26 @@ pub fn process_message(
     }
 }
 
+/// Remove `inventory` hashes from the in-flight set and push them to the
+/// front of the download queue so another peer can re-request them.
+/// No-ops if `inventory` is empty. Always locks queue first, then in_flight.
+fn requeue_unreceived(
+    inventory: &HashSet<BlockHash>,
+    queue: &Mutex<VecDeque<BlockHash>>,
+    in_flight: &Mutex<HashSet<BlockHash>>,
+) {
+    if inventory.is_empty() {
+        return;
+    }
+    let mut q = queue.lock().unwrap();
+    let mut set = in_flight.lock().unwrap();
+    for hash in inventory {
+        set.remove(hash);
+        q.push_front(*hash);
+    }
+    debug!("Re-enqueued {} unreceived blocks", inventory.len());
+}
+
 pub struct BitcoinPeer {
     addr: Address,
     writer: Arc<ConnectionWriter>,
@@ -516,19 +536,7 @@ impl BitcoinPeer {
         in_flight: &Mutex<HashSet<BlockHash>>,
     ) {
         if let PeerStateMachine::AwaitingBlock(ref state) = self.state_machine {
-            if state.peer_inventory.is_empty() {
-                return;
-            }
-            let mut q = queue.lock().unwrap();
-            let mut set = in_flight.lock().unwrap();
-            for hash in &state.peer_inventory {
-                set.remove(hash);
-                q.push_front(*hash);
-            }
-            debug!(
-                "Re-enqueued {} unreceived blocks",
-                state.peer_inventory.len()
-            );
+            requeue_unreceived(&state.peer_inventory, queue, in_flight);
         }
     }
 
@@ -886,19 +894,12 @@ mod tests {
         }
     }
     #[test]
-    fn release_returns_blocks_to_queue_front() {
+    fn requeue_unreceived_restores_queue_and_clears_in_flight() {
         let queue = Mutex::new(VecDeque::from(vec![hash(5), hash(6)]));
         let in_flight = Mutex::new(HashSet::from([hash(1), hash(2), hash(3)]));
+        let inventory = HashSet::from([hash(1), hash(2)]);
 
-        let unreceived = vec![hash(1), hash(2)];
-        {
-            let mut q = queue.lock().unwrap();
-            let mut set = in_flight.lock().unwrap();
-            for h in &unreceived {
-                set.remove(h);
-                q.push_front(*h);
-            }
-        }
+        requeue_unreceived(&inventory, &queue, &in_flight);
 
         let q = queue.lock().unwrap();
         assert_eq!(q.len(), 4);
@@ -914,21 +915,28 @@ mod tests {
     }
 
     #[test]
-    fn released_blocks_can_be_repopped() {
+    fn requeue_unreceived_blocks_can_be_repopped() {
         let queue = Mutex::new(VecDeque::from(vec![hash(5)]));
         let in_flight = Mutex::new(HashSet::from([hash(1)]));
+        let inventory = HashSet::from([hash(1)]);
 
-        {
-            let mut q = queue.lock().unwrap();
-            let mut set = in_flight.lock().unwrap();
-            set.remove(&hash(1));
-            q.push_front(hash(1));
-        }
+        requeue_unreceived(&inventory, &queue, &in_flight);
 
         let batch = pop_download_batch(&queue, &in_flight, 16);
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0], hash(1));
         assert_eq!(batch[1], hash(5));
+    }
+
+    #[test]
+    fn requeue_unreceived_noop_on_empty_inventory() {
+        let queue = Mutex::new(VecDeque::from(vec![hash(1)]));
+        let in_flight = Mutex::new(HashSet::from([hash(2)]));
+
+        requeue_unreceived(&HashSet::new(), &queue, &in_flight);
+
+        assert_eq!(queue.lock().unwrap().len(), 1);
+        assert!(in_flight.lock().unwrap().contains(&hash(2)));
     }
 
     #[test]
