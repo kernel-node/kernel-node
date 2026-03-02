@@ -526,7 +526,9 @@ impl BitcoinPeer {
     }
 
     /// Returns true if this peer is in AwaitingBlock state and has not
-    /// made progress (received a block) within PEER_STALL_TIMEOUT.
+    /// made progress within PEER_STALL_TIMEOUT. The timer resets whenever
+    /// the peer enters AwaitingBlock (i.e. sends a getdata request) and
+    /// whenever it receives a block.
     pub fn is_stalled(&self) -> bool {
         matches!(self.state_machine, PeerStateMachine::AwaitingBlock(_))
             && self.last_progress.elapsed() > PEER_STALL_TIMEOUT
@@ -538,11 +540,15 @@ impl BitcoinPeer {
     ) -> Result<(), p2p::net::Error> {
         let msg = self.receive_message()?;
         let is_block = matches!(msg, NetworkMessage::Block(_));
+        let was_awaiting_block =
+            matches!(self.state_machine, PeerStateMachine::AwaitingBlock(_));
         let old_state = std::mem::take(&mut self.state_machine);
         let (peer_state_machine, mut messages) = process_message(old_state, msg, node_state);
         self.state_machine = peer_state_machine;
 
-        if is_block {
+        let now_awaiting_block =
+            matches!(self.state_machine, PeerStateMachine::AwaitingBlock(_));
+        if is_block || (now_awaiting_block && !was_awaiting_block) {
             self.last_progress = Instant::now();
         }
 
