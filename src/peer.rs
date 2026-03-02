@@ -449,6 +449,26 @@ fn requeue_unreceived(
     debug!("Re-enqueued {} unreceived blocks", inventory.len());
 }
 
+/// Re-insert blocks from `buffer` into the download queue so another peer
+/// can re-download them. These are blocks that arrived out of order and
+/// could not be forwarded because the chain was not contiguous from
+/// `local_tip`. They were already removed from `in_flight_blocks` on
+/// arrival, so only the queue needs updating.
+fn requeue_buffered(
+    buffer: &HashMap<BlockHash, bitcoinkernel::Block>,
+    queue: &Mutex<VecDeque<BlockHash>>,
+) {
+    if buffer.is_empty() {
+        return;
+    }
+    let mut q = queue.lock().unwrap();
+    for block in buffer.values() {
+        let hash = BlockHash::from_byte_array(block.hash().into());
+        q.push_front(hash);
+    }
+    debug!("Re-enqueued {} buffered blocks on peer disconnect", buffer.len());
+}
+
 pub struct BitcoinPeer {
     addr: Address,
     writer: Arc<ConnectionWriter>,
@@ -535,9 +555,10 @@ impl BitcoinPeer {
             .expect("v1 only supported currently"))
     }
 
-    /// Release any block hashes this peer claimed but never received.
-    /// Removes them from the in-flight set and pushes them back to
-    /// the front of the download queue so other peers can pick them up.
+    /// Release any block hashes this peer claimed but never received, and
+    /// re-enqueue any blocks that arrived out of order and are still in the
+    /// buffer. Pushes all of them to the front of the download queue so other
+    /// peers can pick them up.
     pub fn release_in_flight(
         &self,
         queue: &Mutex<VecDeque<BlockHash>>,
@@ -545,6 +566,7 @@ impl BitcoinPeer {
     ) {
         if let PeerStateMachine::AwaitingBlock(ref state) = self.state_machine {
             requeue_unreceived(&state.peer_inventory, queue, in_flight);
+            requeue_buffered(&state.block_buffer, queue);
         }
     }
 
@@ -738,6 +760,33 @@ mod tests {
 
         assert_eq!(queue.lock().unwrap().len(), 1);
         assert!(in_flight.lock().unwrap().contains(&hash(2)));
+    }
+
+    #[test]
+    fn requeue_buffered_restores_arrived_blocks_to_queue() {
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis.header().block_hash();
+        let prev_hash = genesis.header().prev_blockhash;
+
+        let kernel_block = bitcoin_block_to_kernel_block(&genesis);
+        let mut buffer: HashMap<BlockHash, bitcoinkernel::Block> = HashMap::new();
+        buffer.insert(prev_hash, kernel_block);
+
+        let queue = Mutex::new(VecDeque::from(vec![hash(5)]));
+        requeue_buffered(&buffer, &queue);
+
+        let q = queue.lock().unwrap();
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0], genesis_hash, "buffered block re-queued at front");
+        assert_eq!(q[1], hash(5), "existing queue entry preserved");
+    }
+
+    #[test]
+    fn requeue_buffered_noop_on_empty_buffer() {
+        let buffer: HashMap<BlockHash, bitcoinkernel::Block> = HashMap::new();
+        let queue = Mutex::new(VecDeque::from(vec![hash(1)]));
+        requeue_buffered(&buffer, &queue);
+        assert_eq!(queue.lock().unwrap().len(), 1);
     }
 
     #[test]
