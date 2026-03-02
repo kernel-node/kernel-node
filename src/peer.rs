@@ -684,6 +684,8 @@ impl PeerManager {
                                 "Peer thread {}: skipping {} (already connected)",
                                 i, socket_addr
                             );
+                            drop(peers);
+                            thread::sleep(Duration::from_secs(1));
                             continue;
                         }
                         peers.insert(socket_addr);
