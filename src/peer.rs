@@ -383,7 +383,8 @@ pub fn process_message(
                     .block_buffer
                     .insert(prev_blockhash, bitcoin_block_to_kernel_block(&block));
 
-                while let Some(next_block) = block_state.block_buffer.remove(&block_state.local_tip) {
+                while let Some(next_block) = block_state.block_buffer.remove(&block_state.local_tip)
+                {
                     let next_hash = BlockHash::from_byte_array(next_block.hash().into());
                     block_state.local_tip = next_hash;
                     if let Err(err) = node_state.block_tx.send(next_block) {
@@ -469,7 +470,10 @@ fn requeue_buffered(
         let hash = BlockHash::from_byte_array(block.hash().into());
         q.push_front(hash);
     }
-    debug!("Re-enqueued {} buffered blocks on peer disconnect", buffer.len());
+    debug!(
+        "Re-enqueued {} buffered blocks on peer disconnect",
+        buffer.len()
+    );
 }
 
 pub struct BitcoinPeer {
@@ -590,14 +594,12 @@ impl BitcoinPeer {
         let msg = self.receive_message()?;
         let is_block = matches!(msg, NetworkMessage::Block(_));
         let is_headers = matches!(msg, NetworkMessage::Headers(_));
-        let was_awaiting_block =
-            matches!(self.state_machine, PeerStateMachine::AwaitingBlock(_));
+        let was_awaiting_block = matches!(self.state_machine, PeerStateMachine::AwaitingBlock(_));
         let old_state = std::mem::take(&mut self.state_machine);
         let (peer_state_machine, mut messages) = process_message(old_state, msg, node_state);
         self.state_machine = peer_state_machine;
 
-        let now_awaiting_block =
-            matches!(self.state_machine, PeerStateMachine::AwaitingBlock(_));
+        let now_awaiting_block = matches!(self.state_machine, PeerStateMachine::AwaitingBlock(_));
         if is_block || is_headers || (now_awaiting_block && !was_awaiting_block) {
             self.last_progress = Instant::now();
         }
@@ -608,7 +610,6 @@ impl BitcoinPeer {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -913,7 +914,11 @@ mod tests {
     /// keep the receiver alive. If it is dropped, `block_tx.send()` inside
     /// `process_message` will return `Err` and the state machine will exit
     /// AwaitingBlock early instead of transitioning to the next state.
-    fn setup_regtest() -> (TempDir, Arc<NodeState>, mpsc::Receiver<bitcoinkernel::Block>) {
+    fn setup_regtest() -> (
+        TempDir,
+        Arc<NodeState>,
+        mpsc::Receiver<bitcoinkernel::Block>,
+    ) {
         let tmp = TempDir::new().expect("failed to create temp dir");
         let data_dir = tmp.path().join("data");
         let blocks_dir = tmp.path().join("blocks");
@@ -1071,13 +1076,13 @@ mod tests {
             local_tip: prev_hash,
         });
 
-        let (new_state, messages) = process_message(
-            state,
-            NetworkMessage::Block(genesis),
-            &node_state,
-        );
+        let (new_state, messages) =
+            process_message(state, NetworkMessage::Block(genesis), &node_state);
 
-        assert!(messages.is_empty(), "no outbound messages while batch still incomplete");
+        assert!(
+            messages.is_empty(),
+            "no outbound messages while batch still incomplete"
+        );
         match new_state {
             PeerStateMachine::AwaitingBlock(ref ab) => {
                 assert_eq!(
@@ -1086,7 +1091,10 @@ mod tests {
                 );
                 assert_eq!(ab.peer_inventory.len(), 1);
                 assert!(ab.peer_inventory.contains(&hash(99)));
-                assert!(ab.block_buffer.is_empty(), "buffer must be empty after drain");
+                assert!(
+                    ab.block_buffer.is_empty(),
+                    "buffer must be empty after drain"
+                );
             }
             _ => panic!("expected AwaitingBlock"),
         }
@@ -1109,11 +1117,8 @@ mod tests {
             local_tip: prev_hash,
         });
 
-        let (new_state, messages) = process_message(
-            state,
-            NetworkMessage::Block(genesis),
-            &node_state,
-        );
+        let (new_state, messages) =
+            process_message(state, NetworkMessage::Block(genesis), &node_state);
 
         assert!(
             matches!(new_state, PeerStateMachine::AwaitingInv),
@@ -1137,7 +1142,11 @@ mod tests {
         // peer_inventory empties the transition goes to a new AwaitingBlock
         // (instead of AwaitingInv) and we can inspect local_tip.
         let fake_next = hash(42);
-        node_state.download_queue.lock().unwrap().push_back(fake_next);
+        node_state
+            .download_queue
+            .lock()
+            .unwrap()
+            .push_back(fake_next);
 
         let state = PeerStateMachine::AwaitingBlock(AwaitingBlock {
             peer_inventory: HashSet::from([genesis_hash]),
@@ -1145,11 +1154,8 @@ mod tests {
             local_tip: prev_hash,
         });
 
-        let (new_state, messages) = process_message(
-            state,
-            NetworkMessage::Block(genesis),
-            &node_state,
-        );
+        let (new_state, messages) =
+            process_message(state, NetworkMessage::Block(genesis), &node_state);
 
         assert_eq!(messages.len(), 1);
         assert!(matches!(messages[0], NetworkMessage::GetData(_)));

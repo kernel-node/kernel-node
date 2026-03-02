@@ -59,11 +59,7 @@ impl PeerManager {
     ///
     /// `addrman` should already be populated with seed addresses.
     /// `node_state` is shared across all peer threads.
-    pub fn new(
-        addrman: AddrTable,
-        node_state: Arc<NodeState>,
-        network: Network,
-    ) -> Self {
+    pub fn new(addrman: AddrTable, node_state: Arc<NodeState>, network: Network) -> Self {
         Self {
             max_peers: DEFAULT_MAX_PEERS,
             addrman: Arc::new(Mutex::new(addrman)),
