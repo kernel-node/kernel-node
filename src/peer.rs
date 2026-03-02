@@ -272,8 +272,8 @@ pub fn process_message(
                 }
 
                 if headers.0.len() != 2000 {
-                    node_state.headers_synced.store(true, Ordering::SeqCst);
                     populate_download_queue(&node_state.chainman, &node_state.download_queue);
+                    node_state.headers_synced.store(true, Ordering::SeqCst);
                     let batch = pop_download_batch(
                         &node_state.download_queue,
                         &node_state.in_flight_blocks,
