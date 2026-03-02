@@ -32,6 +32,15 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const DNS_RESOLVER: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
 
+/// Last-resort stall threshold for the block processing pipeline.
+///
+/// Individual peer stalls are handled at the peer layer by
+/// `PEER_STALL_TIMEOUT` (30 s), which disconnects a single non-responsive
+/// peer and lets the manager replace it. This longer timeout fires when the
+/// *entire* pipeline has been idle — meaning every peer stalled or
+/// disconnected simultaneously and no replacement produced a block. When it
+/// triggers, all current connections are killed so the manager can open a
+/// fresh set of peers.
 const STALE_BLOCK_DURATION: Duration = Duration::from_secs(60 * 20);
 
 configure_me::include_config!();
