@@ -178,6 +178,11 @@ pub enum PeerStateMachine {
 pub struct AwaitingBlock {
     pub peer_inventory: HashSet<bitcoin::BlockHash>,
     pub block_buffer: HashMap<bitcoin::BlockHash /*prev */, bitcoinkernel::Block>,
+    /// Hash of the last block this peer has sent to the block processing
+    /// channel (block_tx). Updated eagerly on each send so the buffer can
+    /// drain in chain order without waiting for kernel validation to advance
+    /// the global tip.
+    pub local_tip: bitcoin::BlockHash,
 }
 
 /// Build a logarithmic block locator from the active chain.
@@ -288,6 +293,7 @@ pub fn process_message(
                             PeerStateMachine::AwaitingBlock(AwaitingBlock {
                                 peer_inventory: batch.iter().cloned().collect(),
                                 block_buffer: HashMap::new(),
+                                local_tip: node_state.get_tip_state().block_hash,
                             }),
                             vec![create_getdata_message(&batch)],
                         );
@@ -339,6 +345,7 @@ pub fn process_message(
                             PeerStateMachine::AwaitingBlock(AwaitingBlock {
                                 peer_inventory: claimed.iter().cloned().collect(),
                                 block_buffer: HashMap::new(),
+                                local_tip: node_state.get_tip_state().block_hash,
                             }),
                             vec![create_getdata_message(&claimed)],
                         )
@@ -373,20 +380,22 @@ pub fn process_message(
                     .block_buffer
                     .insert(prev_blockhash, bitcoin_block_to_kernel_block(&block));
 
-                while let Some(next_block) = block_state
-                    .block_buffer
-                    .remove(&node_state.get_tip_state().block_hash)
-                {
+                while let Some(next_block) = block_state.block_buffer.remove(&block_state.local_tip) {
+                    let next_hash = BlockHash::from_byte_array(next_block.hash().into());
+                    block_state.local_tip = next_hash;
                     if let Err(err) = node_state.block_tx.send(next_block) {
                         debug!("Encountered error on block send: {}", err);
                         return (PeerStateMachine::AwaitingBlock(block_state), vec![]);
                     }
                 }
 
-                // If all expected blocks were received, clear any remaining
-                // blocks in the buffer and request the next batch.
+                // If all expected blocks were received, request the next batch.
+                // With local_tip draining, the buffer must be empty at this point.
                 if block_state.peer_inventory.is_empty() {
-                    block_state.block_buffer.clear();
+                    debug_assert!(
+                        block_state.block_buffer.is_empty(),
+                        "block_buffer should be fully drained when peer_inventory empties"
+                    );
                     let batch = pop_download_batch(
                         &node_state.download_queue,
                         &node_state.in_flight_blocks,
@@ -397,6 +406,7 @@ pub fn process_message(
                             PeerStateMachine::AwaitingBlock(AwaitingBlock {
                                 peer_inventory: batch.iter().cloned().collect(),
                                 block_buffer: HashMap::new(),
+                                local_tip: block_state.local_tip,
                             }),
                             vec![create_getdata_message(&batch)],
                         )
@@ -488,6 +498,7 @@ impl BitcoinPeer {
                 state_machine = PeerStateMachine::AwaitingBlock(AwaitingBlock {
                     peer_inventory: batch.iter().cloned().collect(),
                     block_buffer: HashMap::new(),
+                    local_tip: node_state.get_tip_state().block_hash,
                 });
             } else {
                 debug!("Headers synced but queue empty, falling back to inv.");
