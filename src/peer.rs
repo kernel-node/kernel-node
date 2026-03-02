@@ -841,7 +841,25 @@ mod tests {
     use p2p::p2p_message_types::message::HeadersMessage;
     use tempfile::TempDir;
 
-    fn setup_regtest() -> (TempDir, Arc<NodeState>) {
+    /// Return the regtest genesis block as `Block<BlockUnchecked>`.
+    ///
+    /// `genesis_block()` returns `Block<BlockChecked>`, but `NetworkMessage::Block`
+    /// wraps `Block<BlockUnchecked>`. A consensus encode/decode round-trip strips
+    /// the type marker while preserving all fields.
+    fn regtest_genesis_unchecked() -> bitcoin::Block {
+        let checked = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let bytes = bitcoin::consensus::serialize(&checked);
+        bitcoin::consensus::deserialize(&bytes).unwrap()
+    }
+
+    /// Create a regtest NodeState for testing.
+    ///
+    /// Returns `(TempDir, Arc<NodeState>, block_rx)`. The caller **must** bind
+    /// `block_rx` (e.g. `let (_tmp, node_state, _rx) = setup_regtest();`) to
+    /// keep the receiver alive. If it is dropped, `block_tx.send()` inside
+    /// `process_message` will return `Err` and the state machine will exit
+    /// AwaitingBlock early instead of transitioning to the next state.
+    fn setup_regtest() -> (TempDir, Arc<NodeState>, mpsc::Receiver<bitcoinkernel::Block>) {
         let tmp = TempDir::new().expect("failed to create temp dir");
         let data_dir = tmp.path().join("data");
         let blocks_dir = tmp.path().join("blocks");
@@ -868,7 +886,7 @@ mod tests {
 
         chainman.import_blocks().expect("failed to import blocks");
 
-        let (block_tx, _block_rx) = mpsc::sync_channel(32);
+        let (block_tx, block_rx) = mpsc::sync_channel(32);
         let (addr_tx, _addr_rx) = mpsc::channel();
         let tip_hash =
             BlockHash::from_byte_array(chainman.active_chain().tip().block_hash().to_bytes());
@@ -886,12 +904,12 @@ mod tests {
             headers_synced: AtomicBool::new(false),
         });
 
-        (tmp, node_state)
+        (tmp, node_state, block_rx)
     }
 
     #[test]
     fn regtest_initial_chain_state() {
-        let (_tmp, node_state) = setup_regtest();
+        let (_tmp, node_state, _block_rx) = setup_regtest();
         let height = node_state.chainman.active_chain().height();
         assert_eq!(height, 0, "regtest should start at height 0");
         assert!(!node_state.headers_synced.load(Ordering::SeqCst));
@@ -901,7 +919,7 @@ mod tests {
 
     #[test]
     fn regtest_process_ping_returns_pong() {
-        let (_tmp, node_state) = setup_regtest();
+        let (_tmp, node_state, _block_rx) = setup_regtest();
         let (state, messages) = process_message(
             PeerStateMachine::AwaitingHeaders,
             NetworkMessage::Ping(42),
@@ -914,7 +932,7 @@ mod tests {
 
     #[test]
     fn regtest_empty_headers_completes_sync() {
-        let (_tmp, node_state) = setup_regtest();
+        let (_tmp, node_state, _block_rx) = setup_regtest();
         let (state, messages) = process_message(
             PeerStateMachine::AwaitingHeaders,
             NetworkMessage::Headers(HeadersMessage(vec![])),
@@ -928,7 +946,7 @@ mod tests {
 
     #[test]
     fn regtest_headers_synced_flag_persists() {
-        let (_tmp, node_state) = setup_regtest();
+        let (_tmp, node_state, _block_rx) = setup_regtest();
         let _ = process_message(
             PeerStateMachine::AwaitingHeaders,
             NetworkMessage::Headers(HeadersMessage(vec![])),
@@ -945,7 +963,7 @@ mod tests {
 
     #[test]
     fn regtest_process_block_header_genesis() {
-        let (_tmp, node_state) = setup_regtest();
+        let (_tmp, node_state, _block_rx) = setup_regtest();
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
         let kernel_header = bitcoin_header_to_kernel_header(genesis.header());
         let result = node_state.chainman.process_block_header(&kernel_header);
@@ -954,7 +972,7 @@ mod tests {
 
     #[test]
     fn regtest_inv_deduplication() {
-        let (_tmp, node_state) = setup_regtest();
+        let (_tmp, node_state, _block_rx) = setup_regtest();
         let (state, _) = process_message(
             PeerStateMachine::AwaitingHeaders,
             NetworkMessage::Headers(HeadersMessage(vec![])),
@@ -980,5 +998,116 @@ mod tests {
         assert!(matches!(state2, PeerStateMachine::AwaitingInv));
         assert_eq!(messages2.len(), 1);
         assert!(matches!(messages2[0], NetworkMessage::GetBlocks(_)));
+    }
+
+    #[test]
+    fn local_tip_advances_on_block_receipt() {
+        let (_tmp, node_state, _block_rx) = setup_regtest();
+        let genesis_checked = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis_checked.header().block_hash();
+        let prev_hash = genesis_checked.header().prev_blockhash;
+        let genesis = regtest_genesis_unchecked();
+
+        // Two blocks expected: genesis + one placeholder (hash(99)).
+        // Having two keeps peer_inventory non-empty after genesis arrives so
+        // we stay in AwaitingBlock and can inspect local_tip directly.
+        let state = PeerStateMachine::AwaitingBlock(AwaitingBlock {
+            peer_inventory: HashSet::from([genesis_hash, hash(99)]),
+            block_buffer: HashMap::new(),
+            local_tip: prev_hash,
+        });
+
+        let (new_state, messages) = process_message(
+            state,
+            NetworkMessage::Block(genesis),
+            &node_state,
+        );
+
+        assert!(messages.is_empty(), "no outbound messages while batch still incomplete");
+        match new_state {
+            PeerStateMachine::AwaitingBlock(ref ab) => {
+                assert_eq!(
+                    ab.local_tip, genesis_hash,
+                    "local_tip must advance to the received block's hash"
+                );
+                assert_eq!(ab.peer_inventory.len(), 1);
+                assert!(ab.peer_inventory.contains(&hash(99)));
+                assert!(ab.block_buffer.is_empty(), "buffer must be empty after drain");
+            }
+            _ => panic!("expected AwaitingBlock"),
+        }
+    }
+
+    #[test]
+    fn block_buffer_empty_when_batch_completes() {
+        let (_tmp, node_state, _block_rx) = setup_regtest();
+        let genesis_checked = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis_checked.header().block_hash();
+        let prev_hash = genesis_checked.header().prev_blockhash;
+        let genesis = regtest_genesis_unchecked();
+
+        // Only genesis in the batch. On receipt peer_inventory empties.
+        // The download queue is empty (regtest has no headers ahead of genesis),
+        // so we transition to AwaitingInv.
+        let state = PeerStateMachine::AwaitingBlock(AwaitingBlock {
+            peer_inventory: HashSet::from([genesis_hash]),
+            block_buffer: HashMap::new(),
+            local_tip: prev_hash,
+        });
+
+        let (new_state, messages) = process_message(
+            state,
+            NetworkMessage::Block(genesis),
+            &node_state,
+        );
+
+        assert!(
+            matches!(new_state, PeerStateMachine::AwaitingInv),
+            "empty queue should transition to AwaitingInv"
+        );
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0], NetworkMessage::GetBlocks(_)));
+        // If the debug_assert!(block_buffer.is_empty()) had fired, the test
+        // would have panicked before reaching this point.
+    }
+
+    #[test]
+    fn local_tip_carried_into_next_batch() {
+        let (_tmp, node_state, _block_rx) = setup_regtest();
+        let genesis_checked = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis_checked.header().block_hash();
+        let prev_hash = genesis_checked.header().prev_blockhash;
+        let genesis = regtest_genesis_unchecked();
+
+        // Seed the download queue with a fake next-batch hash so that when
+        // peer_inventory empties the transition goes to a new AwaitingBlock
+        // (instead of AwaitingInv) and we can inspect local_tip.
+        let fake_next = hash(42);
+        node_state.download_queue.lock().unwrap().push_back(fake_next);
+
+        let state = PeerStateMachine::AwaitingBlock(AwaitingBlock {
+            peer_inventory: HashSet::from([genesis_hash]),
+            block_buffer: HashMap::new(),
+            local_tip: prev_hash,
+        });
+
+        let (new_state, messages) = process_message(
+            state,
+            NetworkMessage::Block(genesis),
+            &node_state,
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0], NetworkMessage::GetData(_)));
+        match new_state {
+            PeerStateMachine::AwaitingBlock(ref ab) => {
+                assert_eq!(
+                    ab.local_tip, genesis_hash,
+                    "local_tip must carry forward from the previous batch, not reset to the global tip"
+                );
+                assert!(ab.peer_inventory.contains(&fake_next));
+            }
+            _ => panic!("expected AwaitingBlock with next batch"),
+        }
     }
 }
