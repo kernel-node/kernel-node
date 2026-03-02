@@ -43,8 +43,9 @@ const PEER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Walk backwards from the header tip to the active chain tip, collecting
 /// block hashes into the download queue. Only populates if the queue is empty.
 fn populate_download_queue(chainman: &ChainstateManager, queue: &Mutex<VecDeque<BlockHash>>) {
-    let mut q = queue.lock().unwrap();
-    if !q.is_empty() {
+    // Early-exit without holding the lock during the chain walk.
+    // We re-check under the lock below before assigning.
+    if !queue.lock().unwrap().is_empty() {
         return;
     }
     let active_height = chainman.active_chain().height();
@@ -68,6 +69,12 @@ fn populate_download_queue(chainman: &ChainstateManager, queue: &Mutex<VecDeque<
         }
     }
     hashes.reverse();
+    // Acquire the lock only to assign. Re-check emptiness in case another
+    // thread populated the queue while we were walking the chain.
+    let mut q = queue.lock().unwrap();
+    if !q.is_empty() {
+        return;
+    }
     info!(
         "Built download queue with {} blocks (heights {} to {})",
         hashes.len(),
