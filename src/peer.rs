@@ -33,8 +33,11 @@ const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::INVALID_CB_NO_BAN_VER
 /// Number of blocks each peer requests per batch from the download queue.
 const DOWNLOAD_BATCH_SIZE: usize = 16;
 
-/// If a peer stays in AwaitingBlock for this long without receiving any
-/// block, it is considered stalled and disconnected.
+/// If a peer stays in an active IBD state (AwaitingHeaders or AwaitingBlock)
+/// for this long without making progress, it is considered stalled and
+/// disconnected. AwaitingInv is exempt: it is the rest state where waiting
+/// is expected (steady-state post-IBD, or between batches when the queue
+/// is temporarily exhausted).
 const PEER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Walk backwards from the header tip to the active chain tip, collecting
@@ -570,12 +573,13 @@ impl BitcoinPeer {
         }
     }
 
-    /// Returns true if this peer is in AwaitingBlock state and has not
-    /// made progress within PEER_STALL_TIMEOUT. The timer resets whenever
-    /// the peer enters AwaitingBlock (i.e. sends a getdata request) and
-    /// whenever it receives a block.
+    /// Returns true if this peer is in an active IBD state (AwaitingHeaders
+    /// or AwaitingBlock) and has not made progress within PEER_STALL_TIMEOUT.
+    /// Progress resets on: block received, headers batch received, or entering
+    /// AwaitingBlock (i.e. sending a getdata request).
+    /// AwaitingInv never stalls: it is the expected rest state.
     pub fn is_stalled(&self) -> bool {
-        matches!(self.state_machine, PeerStateMachine::AwaitingBlock(_))
+        !matches!(self.state_machine, PeerStateMachine::AwaitingInv)
             && self.last_progress.elapsed() > PEER_STALL_TIMEOUT
     }
 
@@ -585,6 +589,7 @@ impl BitcoinPeer {
     ) -> Result<(), p2p::net::Error> {
         let msg = self.receive_message()?;
         let is_block = matches!(msg, NetworkMessage::Block(_));
+        let is_headers = matches!(msg, NetworkMessage::Headers(_));
         let was_awaiting_block =
             matches!(self.state_machine, PeerStateMachine::AwaitingBlock(_));
         let old_state = std::mem::take(&mut self.state_machine);
@@ -593,7 +598,7 @@ impl BitcoinPeer {
 
         let now_awaiting_block =
             matches!(self.state_machine, PeerStateMachine::AwaitingBlock(_));
-        if is_block || (now_awaiting_block && !was_awaiting_block) {
+        if is_block || is_headers || (now_awaiting_block && !was_awaiting_block) {
             self.last_progress = Instant::now();
         }
 
