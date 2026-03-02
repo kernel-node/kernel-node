@@ -16,7 +16,8 @@ use bitcoinkernel::{
     core::BlockHashExt, prelude::BlockValidationStateExt, ChainType, ChainstateManagerBuilder,
     Context, ContextBuilder, Log, Logger, ProcessBlockResult, SynchronizationState, ValidationMode,
 };
-use kernel_node::peer::{NodeState, PeerManager, TipState};
+use kernel_node::peer::{NodeState, TipState};
+use kernel_node::peer_manager::{AddrTable, PeerManager};
 use kernel_node::{
     echo_capnp::echo,
     ipc::IpcInterface,
@@ -163,7 +164,7 @@ fn run(
     addr_rx: mpsc::Receiver<AddrV2Payload>,
     block_rx: mpsc::Receiver<bitcoinkernel::Block>,
 ) -> std::io::Result<()> {
-    let mut table = addrman::Table::new();
+    let mut table = AddrTable::new();
     match connect {
         Some(connect) => {
             let record = match connect.ip() {
