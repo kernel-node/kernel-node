@@ -1,6 +1,6 @@
 use std::{
     collections::{HashSet, VecDeque},
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::DerefMut,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -16,7 +16,8 @@ use bitcoinkernel::{
     core::BlockHashExt, prelude::BlockValidationStateExt, ChainType, ChainstateManagerBuilder,
     Context, ContextBuilder, Log, Logger, SynchronizationState, ValidationMode,
 };
-use kernel_node::peer::{BitcoinPeer, NodeState, TipState};
+use kernel_node::peer::{NodeState, TipState};
+use kernel_node::peer_manager::{AddrTable, PeerManager};
 use kernel_node::{
     echo_capnp::echo,
     ipc::IpcInterface,
@@ -30,12 +31,11 @@ use p2p::{
 use tokio::net::UnixListener;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-const TABLE_WIDTH: usize = 16;
-const TABLE_SLOT: usize = 16;
-const MAX_BUCKETS: usize = 4;
-
 const DNS_RESOLVER: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
 
+/// Pipeline-level stall guard: fires when no block arrives for this long,
+/// meaning all peers failed simultaneously. Kills all connections so the
+/// manager opens a fresh set. Individual peer stalls use PEER_STALL_TIMEOUT.
 const STALE_BLOCK_DURATION: Duration = Duration::from_secs(60 * 20);
 
 configure_me::include_config!();
@@ -83,7 +83,6 @@ fn create_context(
                     shutdown_tx_clone.send(()).expect("failed to send shutdown signal");
                 }
         })
-        // .with_block_checked_validation(setup_validation_interface(tip_state))
         .with_block_checked_validation(move |block: bitcoinkernel::Block, state: bitcoinkernel::BlockValidationStateRef<'_>| {
             match state.mode() {
                 ValidationMode::Valid => {
@@ -103,7 +102,7 @@ struct KernelLog {}
 impl Log for KernelLog {
     fn log(&self, message: &str) {
         log::info!(
-            target: "bitcoinkernel", 
+            target: "bitcoinkernel",
             "{}", message.strip_suffix("\r\n").or_else(|| message.strip_suffix('\n')).unwrap_or(message));
     }
 }
@@ -169,12 +168,13 @@ fn resolve_seeds(network: Network) -> Vec<IpAddr> {
 fn run(
     network: Network,
     connect: Option<SocketAddr>,
-    node_state: NodeState,
+    maxpeers: usize,
+    node_state: Arc<NodeState>,
     shutdown_rx: mpsc::Receiver<()>,
     addr_rx: mpsc::Receiver<AddrV2Payload>,
     block_rx: mpsc::Receiver<bitcoinkernel::Block>,
 ) -> std::io::Result<()> {
-    let mut table = addrman::Table::<TABLE_WIDTH, TABLE_SLOT, MAX_BUCKETS>::new();
+    let mut table = AddrTable::new();
     match connect {
         Some(connect) => {
             let record = match connect.ip() {
@@ -218,70 +218,19 @@ fn run(
 
     let chainman = Arc::clone(&node_state.chainman);
     let context = Arc::clone(&node_state.context);
-    let addrman = Arc::new(Mutex::new(table));
 
-    let running = Arc::new(AtomicBool::new(true));
-    let running_addr = running.clone();
-    let running_peer = running.clone();
-    let running_block = running.clone();
+    let mut peer_manager =
+        PeerManager::new(table, Arc::clone(&node_state), network).max_peers(maxpeers);
+    let peer_manager_addrman = Arc::clone(peer_manager.addrman());
+    let running_block = peer_manager.running();
 
-    let peer_source = Arc::clone(&addrman);
-    let kill = Arc::new(Mutex::new(None));
-    let writer = Arc::clone(&kill);
-    let stale_block_kill = Arc::clone(&kill);
-
-    let peer_processing_handler = thread::spawn(move || {
-        info!("Starting net processing thread.");
-        while running_peer.load(Ordering::SeqCst) {
-            let addr_lock = peer_source.lock().unwrap();
-            let (address, port) = addr_lock.select().unwrap().network_addr();
-            let peer = match address {
-                AddrV2::Ipv4(ipv4) => BitcoinPeer::new(
-                    SocketAddr::V4(SocketAddrV4::new(ipv4, port)),
-                    network,
-                    &node_state,
-                ),
-                AddrV2::Ipv6(ipv6) => {
-                    let socket_adrr = (ipv6, port).into();
-                    BitcoinPeer::new(socket_adrr, network, &node_state)
-                }
-                _ => continue,
-            };
-            let mut peer = match peer {
-                Ok(connection) => {
-                    let mut writer_lock = writer.lock().unwrap();
-                    *writer_lock = Some(connection.writer());
-                    connection
-                }
-                Err(e) => {
-                    error!("Could not connect: {e}");
-                    std::thread::sleep(Duration::from_millis(500));
-                    continue;
-                }
-            };
-            loop {
-                if let Err(e) = peer.receive_and_process_message(&node_state) {
-                    match e {
-                        p2p::net::Error::Io(io) => {
-                            if io.kind() != std::io::ErrorKind::UnexpectedEof {
-                                error!("Unexpected I/O error: {}", io);
-                            }
-                        }
-                        e => error!("Error processing message: {e}"),
-                    }
-                    break;
-                }
-            }
-        }
-        info!("Stopping net processing thread.");
-    });
-
+    let running_addr = Arc::clone(&running_block);
     let addr_processing_handler = thread::spawn(move || {
         info!("Starting addr processing thread.");
         while running_addr.load(Ordering::SeqCst) {
             match addr_rx.recv() {
                 Ok(payload) => {
-                    let mut addr_lock = addrman.lock().unwrap();
+                    let mut addr_lock = peer_manager_addrman.lock().unwrap();
                     for address in payload.0 {
                         let record = addrman::Record::new(
                             address.addr,
@@ -298,23 +247,45 @@ fn run(
         info!("Stopping addr processing thread.");
     });
 
+    let peer_writers = peer_manager.peer_writers().to_vec();
+    let node_state_block = Arc::clone(&node_state);
     let block_processing_handler = thread::spawn(move || {
         info!("Starting block processing thread.");
         let mut last_block = Instant::now();
+        let mut last_log = Instant::now();
+        let mut blocks_since_log: u64 = 0;
         while running_block.load(Ordering::SeqCst) {
             match block_rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(block) => {
                     debug!("Validating block.");
                     last_block = Instant::now();
                     let _ = chainman.process_block(&block);
+                    blocks_since_log += 1;
+                    if last_log.elapsed() >= Duration::from_secs(10) {
+                        let height = chainman.active_chain().height();
+                        let queue_remaining = node_state_block.download_queue.lock().unwrap().len();
+                        let in_flight = node_state_block.in_flight_blocks.lock().unwrap().len();
+                        info!(
+                            "Progress: height={}, validated {} blocks in {:.1}s, queue={}, in_flight={}",
+                            height,
+                            blocks_since_log,
+                            last_log.elapsed().as_secs_f64(),
+                            queue_remaining,
+                            in_flight,
+                        );
+                        blocks_since_log = 0;
+                        last_log = Instant::now();
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if last_block.elapsed() > STALE_BLOCK_DURATION {
                         last_block = Instant::now();
-                        info!("Potential stale block. Finding a new peer.");
-                        let mut peer_lock = stale_block_kill.lock().unwrap();
-                        if let Some(conn) = peer_lock.deref_mut() {
-                            let _ = conn.shutdown();
+                        info!("Potential stale block. Disconnecting all peers.");
+                        for writer_slot in &peer_writers {
+                            let mut w = writer_slot.lock().unwrap();
+                            if let Some(conn) = w.deref_mut() {
+                                let _ = conn.shutdown();
+                            }
                         }
                     }
                     continue;
@@ -325,19 +296,17 @@ fn run(
         info!("Stopping block processing thread.");
     });
 
+    peer_manager.start();
+
     if let Ok(()) = shutdown_rx.recv() {
         context.interrupt().unwrap();
-        let mut peer_lock = kill.lock().unwrap();
-        if let Some(conn) = peer_lock.deref_mut() {
-            conn.shutdown().unwrap()
-        }
         info!("Received shutdown signal, shutting down...");
-        running.store(false, Ordering::SeqCst);
+        peer_manager.stop();
     }
 
     addr_processing_handler.join().unwrap();
-    peer_processing_handler.join().unwrap();
     block_processing_handler.join().unwrap();
+    peer_manager.join();
 
     info!("exiting.");
     Ok(())
@@ -370,7 +339,7 @@ fn main() {
     let (block_tx, block_rx) = mpsc::sync_channel(32);
     let (addr_tx, addr_rx) = mpsc::channel();
 
-    let node_state = NodeState {
+    let node_state = Arc::new(NodeState {
         addr_tx,
         block_tx,
         tip_state,
@@ -378,7 +347,7 @@ fn main() {
         context: Arc::clone(&context),
         in_flight_blocks: Mutex::new(HashSet::new()),
         download_queue: Mutex::new(VecDeque::new()),
-    };
+    });
 
     if let Err(err) = node_state.chainman.import_blocks() {
         error!("Error importing blocks: {}", err);
@@ -433,5 +402,14 @@ fn main() {
         })
     });
 
-    run(network, connect, node_state, shutdown_rx, addr_rx, block_rx).unwrap()
+    run(
+        network,
+        connect,
+        config.maxpeers,
+        node_state,
+        shutdown_rx,
+        addr_rx,
+        block_rx,
+    )
+    .unwrap()
 }

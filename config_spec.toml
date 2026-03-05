@@ -15,3 +15,9 @@ name = "connect"
 type = "String"
 optional = true
 doc = "Connect only to this node (format: ip:port or hostname:port)"
+
+[[param]]
+name = "maxpeers"
+type = "usize"
+default = "4"
+doc = "Maximum number of concurrent peer connections during IBD."
