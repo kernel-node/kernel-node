@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     ops::DerefMut,
     sync::{
@@ -168,7 +169,7 @@ fn resolve_seeds(network: Network) -> Vec<IpAddr> {
 fn run(
     network: Network,
     connect: Option<SocketAddr>,
-    mut node_state: NodeState,
+    node_state: NodeState,
     shutdown_rx: mpsc::Receiver<()>,
     addr_rx: mpsc::Receiver<AddrV2Payload>,
     block_rx: mpsc::Receiver<bitcoinkernel::Block>,
@@ -238,11 +239,11 @@ fn run(
                 AddrV2::Ipv4(ipv4) => BitcoinPeer::new(
                     SocketAddr::V4(SocketAddrV4::new(ipv4, port)),
                     network,
-                    &mut node_state,
+                    &node_state,
                 ),
                 AddrV2::Ipv6(ipv6) => {
                     let socket_adrr = (ipv6, port).into();
-                    BitcoinPeer::new(socket_adrr, network, &mut node_state)
+                    BitcoinPeer::new(socket_adrr, network, &node_state)
                 }
                 _ => continue,
             };
@@ -259,7 +260,7 @@ fn run(
                 }
             };
             loop {
-                if let Err(e) = peer.receive_and_process_message(&mut node_state) {
+                if let Err(e) = peer.receive_and_process_message(&node_state) {
                     match e {
                         p2p::net::Error::Io(io) => {
                             if io.kind() != std::io::ErrorKind::UnexpectedEof {
@@ -366,7 +367,7 @@ fn main() {
         );
     let chainman = Arc::new(chainman_builder.build().unwrap());
 
-    let (block_tx, block_rx) = mpsc::sync_channel(1);
+    let (block_tx, block_rx) = mpsc::sync_channel(32);
     let (addr_tx, addr_rx) = mpsc::channel();
 
     let node_state = NodeState {
@@ -375,6 +376,8 @@ fn main() {
         tip_state,
         chainman,
         context: Arc::clone(&context),
+        in_flight_blocks: Mutex::new(HashSet::new()),
+        download_queue: Mutex::new(VecDeque::new()),
     };
 
     if let Err(err) = node_state.chainman.import_blocks() {
