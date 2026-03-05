@@ -3,6 +3,7 @@ use std::{
     fmt,
     net::SocketAddr,
     sync::{mpsc, Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use bitcoin::{BlockHash, Network};
@@ -27,6 +28,10 @@ use crate::kernel_util::{bitcoin_block_to_kernel_block, bitcoin_header_to_kernel
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::INVALID_CB_NO_BAN_VERSION;
 
 const DOWNLOAD_BATCH_SIZE: usize = 16;
+
+/// AwaitingInv is exempt: it is the expected idle state between batches
+/// and after IBD completes.
+const PEER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// No-op if the queue is already populated; multiple peers race to call this.
 fn populate_download_queue(chainman: &ChainstateManager, queue: &Mutex<VecDeque<BlockHash>>) {
@@ -398,11 +403,53 @@ pub fn process_message(
     }
 }
 
+/// Pushes to the front of the queue (not back) so re-requested blocks take
+/// priority. Always locks queue first, then in_flight.
+fn requeue_unreceived(
+    inventory: &HashSet<BlockHash>,
+    queue: &Mutex<VecDeque<BlockHash>>,
+    in_flight: &Mutex<HashSet<BlockHash>>,
+) {
+    if inventory.is_empty() {
+        return;
+    }
+    let mut q = queue.lock().unwrap();
+    let mut set = in_flight.lock().unwrap();
+    for hash in inventory {
+        set.remove(hash);
+        q.push_front(*hash);
+    }
+    debug!("Re-enqueued {} unreceived blocks", inventory.len());
+}
+
+/// Blocks in `buffer` arrived out of order and were never forwarded.
+/// They were already removed from `in_flight_blocks` on arrival,
+/// so only the queue needs updating.
+fn requeue_buffered(
+    buffer: &HashMap<BlockHash, bitcoinkernel::Block>,
+    queue: &Mutex<VecDeque<BlockHash>>,
+) {
+    if buffer.is_empty() {
+        return;
+    }
+    let mut q = queue.lock().unwrap();
+    for block in buffer.values() {
+        let hash = BlockHash::from_byte_array(block.hash().into());
+        q.push_front(hash);
+    }
+    debug!(
+        "Re-enqueued {} buffered blocks on peer disconnect",
+        buffer.len()
+    );
+}
+
 pub struct BitcoinPeer {
     addr: Address,
     writer: Arc<ConnectionWriter>,
     reader: ConnectionReader,
     state_machine: PeerStateMachine,
+    /// Reset on block/headers receipt or on entering AwaitingBlock; read by `is_stalled`.
+    last_progress: Instant,
 }
 
 impl fmt::Display for BitcoinPeer {
@@ -437,6 +484,7 @@ impl BitcoinPeer {
             writer: Arc::new(writer),
             reader,
             state_machine: PeerStateMachine::AwaitingHeaders,
+            last_progress: Instant::now(),
         };
         Ok(peer)
     }
@@ -452,14 +500,41 @@ impl BitcoinPeer {
             .expect("v1 only supported currently"))
     }
 
+    pub fn release_in_flight(
+        &self,
+        queue: &Mutex<VecDeque<BlockHash>>,
+        in_flight: &Mutex<HashSet<BlockHash>>,
+    ) {
+        if let PeerStateMachine::AwaitingBlock(ref state) = self.state_machine {
+            requeue_unreceived(&state.peer_inventory, queue, in_flight);
+            requeue_buffered(&state.block_buffer, queue);
+        }
+    }
+
+    /// AwaitingInv is never considered stalled — it is the expected idle state.
+    /// Progress resets on block/headers receipt or on entering AwaitingBlock.
+    pub fn is_stalled(&self) -> bool {
+        !matches!(self.state_machine, PeerStateMachine::AwaitingInv)
+            && self.last_progress.elapsed() > PEER_STALL_TIMEOUT
+    }
+
     pub fn receive_and_process_message(
         &mut self,
         node_state: &NodeState,
     ) -> Result<(), p2p::net::Error> {
         let msg = self.receive_message()?;
+        let is_block = matches!(msg, NetworkMessage::Block(_));
+        let is_headers = matches!(msg, NetworkMessage::Headers(_));
+        let was_awaiting_block = matches!(self.state_machine, PeerStateMachine::AwaitingBlock(_));
         let old_state = std::mem::take(&mut self.state_machine);
         let (peer_state_machine, mut messages) = process_message(old_state, msg, node_state);
         self.state_machine = peer_state_machine;
+
+        let now_awaiting_block = matches!(self.state_machine, PeerStateMachine::AwaitingBlock(_));
+        if is_block || is_headers || (now_awaiting_block && !was_awaiting_block) {
+            self.last_progress = Instant::now();
+        }
+
         for message in messages.drain(..) {
             self.writer.send_message(message)?
         }
@@ -892,6 +967,79 @@ mod tests {
         assert!(matches!(messages[0], NetworkMessage::GetBlocks(_)));
         // If the debug_assert!(block_buffer.is_empty()) had fired, the test
         // would have panicked before reaching this point.
+    }
+
+    #[test]
+    fn requeue_unreceived_restores_queue_and_clears_in_flight() {
+        let queue = Mutex::new(VecDeque::from(vec![hash(5), hash(6)]));
+        let in_flight = Mutex::new(HashSet::from([hash(1), hash(2), hash(3)]));
+        let inventory = HashSet::from([hash(1), hash(2)]);
+
+        requeue_unreceived(&inventory, &queue, &in_flight);
+
+        let q = queue.lock().unwrap();
+        assert_eq!(q.len(), 4);
+        assert!(q.contains(&hash(1)));
+        assert!(q.contains(&hash(2)));
+        assert!(q.contains(&hash(5)));
+        assert!(q.contains(&hash(6)));
+
+        let set = in_flight.lock().unwrap();
+        assert!(!set.contains(&hash(1)));
+        assert!(!set.contains(&hash(2)));
+        assert!(set.contains(&hash(3)));
+    }
+
+    #[test]
+    fn requeue_unreceived_blocks_can_be_repopped() {
+        let queue = Mutex::new(VecDeque::from(vec![hash(5)]));
+        let in_flight = Mutex::new(HashSet::from([hash(1)]));
+        let inventory = HashSet::from([hash(1)]);
+
+        requeue_unreceived(&inventory, &queue, &in_flight);
+
+        let batch = pop_download_batch(&queue, &in_flight, 16);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0], hash(1));
+        assert_eq!(batch[1], hash(5));
+    }
+
+    #[test]
+    fn requeue_unreceived_noop_on_empty_inventory() {
+        let queue = Mutex::new(VecDeque::from(vec![hash(1)]));
+        let in_flight = Mutex::new(HashSet::from([hash(2)]));
+
+        requeue_unreceived(&HashSet::new(), &queue, &in_flight);
+
+        assert_eq!(queue.lock().unwrap().len(), 1);
+        assert!(in_flight.lock().unwrap().contains(&hash(2)));
+    }
+
+    #[test]
+    fn requeue_buffered_restores_arrived_blocks_to_queue() {
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis.header().block_hash();
+        let prev_hash = genesis.header().prev_blockhash;
+
+        let kernel_block = bitcoin_block_to_kernel_block(&genesis);
+        let mut buffer: HashMap<BlockHash, bitcoinkernel::Block> = HashMap::new();
+        buffer.insert(prev_hash, kernel_block);
+
+        let queue = Mutex::new(VecDeque::from(vec![hash(5)]));
+        requeue_buffered(&buffer, &queue);
+
+        let q = queue.lock().unwrap();
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0], genesis_hash, "buffered block re-queued at front");
+        assert_eq!(q[1], hash(5), "existing queue entry preserved");
+    }
+
+    #[test]
+    fn requeue_buffered_noop_on_empty_buffer() {
+        let buffer: HashMap<BlockHash, bitcoinkernel::Block> = HashMap::new();
+        let queue = Mutex::new(VecDeque::from(vec![hash(1)]));
+        requeue_buffered(&buffer, &queue);
+        assert_eq!(queue.lock().unwrap().len(), 1);
     }
 
     #[test]
