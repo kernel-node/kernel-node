@@ -6,13 +6,19 @@ use std::{
 };
 
 use bitcoin::{BlockHash, Network};
-use bitcoinkernel::{ChainstateManager, Context, ProcessBlockHeaderResult, ValidationMode, core::BlockHashExt, prelude::BlockValidationStateExt};
+use bitcoinkernel::{
+    core::BlockHashExt, prelude::BlockValidationStateExt, ChainstateManager, Context,
+    ProcessBlockHeaderResult, ValidationMode,
+};
 use log::{debug, info, warn};
 use p2p::{
     handshake::ConnectionConfig,
     net::{ConnectionExt, ConnectionReader, ConnectionWriter, TimeoutParams},
     p2p_message_types::{
-        Address, ProtocolVersion, ServiceFlags, message::{AddrV2Payload, InventoryPayload, NetworkMessage}, message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory}, message_network::UserAgent
+        message::{AddrV2Payload, InventoryPayload, NetworkMessage},
+        message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory},
+        message_network::UserAgent,
+        Address, ProtocolVersion, ServiceFlags,
     },
 };
 
@@ -55,6 +61,7 @@ impl NodeState {
 
 /// State Machine for setting up a connection and getting blocks from a peer
 ///
+/// ```text
 ///       [*]
 ///        │
 /// AwaitingHeaders
@@ -68,6 +75,7 @@ impl NodeState {
 ///       │ │
 ///       └─┘
 ///      Block
+/// ```
 #[derive(Default)]
 pub enum PeerStateMachine {
     #[default]
@@ -81,18 +89,45 @@ pub struct AwaitingBlock {
     pub block_buffer: HashMap<bitcoin::BlockHash /*prev */, bitcoinkernel::Block>,
 }
 
-fn create_getheaders_message(known_block_hash: bitcoin::BlockHash) -> NetworkMessage {
+/// Logarithmic spacing lets the remote peer find the fork point efficiently
+/// even after a deep reorg.
+fn build_block_locator(chainman: &ChainstateManager) -> Vec<BlockHash> {
+    let chain = chainman.active_chain();
+    let height = chain.height();
+    if height < 0 {
+        return vec![];
+    }
+    let mut locator = Vec::new();
+    let mut index = height as usize;
+    let mut step: usize = 1;
+    loop {
+        if let Some(entry) = chain.at_height(index) {
+            let hash = BlockHash::from_byte_array(entry.block_hash().to_bytes());
+            locator.push(hash);
+        }
+        if index == 0 {
+            break;
+        }
+        if locator.len() > 10 {
+            step *= 2;
+        }
+        index = index.saturating_sub(step);
+    }
+    locator
+}
+
+fn create_getheaders_message(locator_hashes: Vec<bitcoin::BlockHash>) -> NetworkMessage {
     NetworkMessage::GetHeaders(GetHeadersMessage {
         version: PROTOCOL_VERSION,
-        locator_hashes: vec![known_block_hash],
+        locator_hashes,
         stop_hash: bitcoin::BlockHash::GENESIS_PREVIOUS_BLOCK_HASH,
     })
 }
 
-fn create_getblocks_message(known_block_hash: bitcoin::BlockHash) -> NetworkMessage {
+fn create_getblocks_message(locator_hashes: Vec<bitcoin::BlockHash>) -> NetworkMessage {
     NetworkMessage::GetBlocks(GetBlocksMessage {
         version: PROTOCOL_VERSION,
-        locator_hashes: vec![known_block_hash],
+        locator_hashes,
         stop_hash: bitcoin::BlockHash::GENESIS_PREVIOUS_BLOCK_HASH,
     })
 }
@@ -128,9 +163,13 @@ pub fn process_message(
         PeerStateMachine::AwaitingHeaders => match event {
             NetworkMessage::Headers(headers) => {
                 for header in &headers.0 {
-                    let result = node_state.chainman.process_block_header(&bitcoin_header_to_kernel_header(&header));
+                    let result = node_state
+                        .chainman
+                        .process_block_header(&bitcoin_header_to_kernel_header(&header));
                     match result {
-                        ProcessBlockHeaderResult::Success(state) if state.mode() == ValidationMode::Valid => {
+                        ProcessBlockHeaderResult::Success(state)
+                            if state.mode() == ValidationMode::Valid =>
+                        {
                             debug!("Processed header: {}", header.time.to_u32());
                             continue;
                         }
@@ -142,18 +181,24 @@ pub fn process_message(
                 }
 
                 if headers.0.len() != 2000 {
-                    let tip_hash = node_state.get_tip_state().block_hash;
-                    return (PeerStateMachine::AwaitingInv, vec![create_getblocks_message(tip_hash)]);
+                    let locator = build_block_locator(&node_state.chainman);
+                    return (
+                        PeerStateMachine::AwaitingInv,
+                        vec![create_getblocks_message(locator)],
+                    );
                 }
 
-                let best_hash = BlockHash::from_byte_array(node_state.chainman.best_entry().unwrap().block_hash().to_bytes());
-                (PeerStateMachine::AwaitingHeaders, vec![create_getheaders_message(best_hash)])
+                let locator = build_block_locator(&node_state.chainman);
+                (
+                    PeerStateMachine::AwaitingHeaders,
+                    vec![create_getheaders_message(locator)],
+                )
             }
             message => {
                 debug!("Ignoring message: {:?}", message);
                 (PeerStateMachine::AwaitingHeaders, vec![])
             }
-        }
+        },
         PeerStateMachine::AwaitingInv => match event {
             NetworkMessage::Inv(inventory) => {
                 debug!("Received inventory with {} items", inventory.0.len());
@@ -208,10 +253,10 @@ pub fn process_message(
                 // blocks.
                 if block_state.peer_inventory.is_empty() {
                     block_state.block_buffer.clear();
-                    let our_best = node_state.get_tip_state().block_hash;
+                    let locator = build_block_locator(&node_state.chainman);
                     (
                         PeerStateMachine::AwaitingInv,
-                        vec![create_getblocks_message(our_best)],
+                        vec![create_getblocks_message(locator)],
                     )
                 } else {
                     (PeerStateMachine::AwaitingBlock(block_state), vec![])
@@ -256,16 +301,13 @@ impl BitcoinPeer {
 
         let addr = Address::new(&socket_addr, ServiceFlags::WITNESS);
         info!("Connected to {:?}", addr);
-        let state_machine = PeerStateMachine::AwaitingHeaders;
-        let best_hash = BlockHash::from_byte_array(node_state.chainman.best_entry().unwrap().block_hash().to_bytes());
-        let getheaders = create_getheaders_message(best_hash);
-        debug!("sending headers message...");
-        writer.send_message(getheaders)?;
+        let locator = build_block_locator(&node_state.chainman);
+        writer.send_message(create_getheaders_message(locator))?;
         let peer = BitcoinPeer {
             addr,
             writer: Arc::new(writer),
             reader,
-            state_machine,
+            state_machine: PeerStateMachine::AwaitingHeaders,
         };
         Ok(peer)
     }
@@ -293,5 +335,107 @@ impl BitcoinPeer {
             self.writer.send_message(message)?
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash(n: u8) -> BlockHash {
+        BlockHash::from_byte_array([n; 32])
+    }
+
+    #[test]
+    fn create_getdata_message_wraps_as_witness_block() {
+        let hashes = vec![hash(1), hash(2)];
+        let msg = create_getdata_message(&hashes);
+        match msg {
+            NetworkMessage::GetData(payload) => {
+                assert_eq!(payload.0.len(), 2);
+                assert!(matches!(payload.0[0], Inventory::WitnessBlock(_)));
+            }
+            _ => panic!("expected GetData message"),
+        }
+    }
+
+    #[test]
+    fn create_getheaders_uses_protocol_version() {
+        let msg = create_getheaders_message(vec![hash(1), hash(2)]);
+        match msg {
+            NetworkMessage::GetHeaders(gh) => {
+                assert_eq!(gh.version, PROTOCOL_VERSION);
+                assert_eq!(gh.locator_hashes.len(), 2);
+                assert_eq!(gh.locator_hashes[0], hash(1));
+                assert_eq!(gh.locator_hashes[1], hash(2));
+            }
+            _ => panic!("expected GetHeaders message"),
+        }
+    }
+
+    #[test]
+    fn create_getblocks_uses_protocol_version() {
+        let msg = create_getblocks_message(vec![hash(1), hash(2)]);
+        match msg {
+            NetworkMessage::GetBlocks(gb) => {
+                assert_eq!(gb.version, PROTOCOL_VERSION);
+                assert_eq!(gb.locator_hashes.len(), 2);
+                assert_eq!(gb.locator_hashes[0], hash(1));
+                assert_eq!(gb.locator_hashes[1], hash(2));
+            }
+            _ => panic!("expected GetBlocks message"),
+        }
+    }
+
+    #[test]
+    fn create_getdata_message_all_items_are_witness_block() {
+        let hashes = vec![hash(1), hash(2), hash(3)];
+        let msg = create_getdata_message(&hashes);
+        match msg {
+            NetworkMessage::GetData(payload) => {
+                for (i, inv) in payload.0.iter().enumerate() {
+                    assert!(
+                        matches!(inv, Inventory::WitnessBlock(_)),
+                        "item {} should be WitnessBlock, got {:?}",
+                        i,
+                        inv
+                    );
+                }
+            }
+            _ => panic!("expected GetData message"),
+        }
+    }
+
+    #[test]
+    fn create_getdata_message_empty_input() {
+        let msg = create_getdata_message(&[]);
+        match msg {
+            NetworkMessage::GetData(payload) => {
+                assert!(payload.0.is_empty());
+            }
+            _ => panic!("expected GetData message"),
+        }
+    }
+
+    #[test]
+    fn create_getheaders_stop_hash_is_genesis() {
+        let msg = create_getheaders_message(vec![hash(1)]);
+        match msg {
+            NetworkMessage::GetHeaders(gh) => {
+                assert_eq!(gh.stop_hash, BlockHash::GENESIS_PREVIOUS_BLOCK_HASH);
+            }
+            _ => panic!("expected GetHeaders message"),
+        }
+    }
+
+    #[test]
+    fn create_getblocks_stop_hash_is_genesis() {
+        let msg = create_getblocks_message(vec![hash(1)]);
+        match msg {
+            NetworkMessage::GetBlocks(gb) => {
+                assert_eq!(gb.stop_hash, BlockHash::GENESIS_PREVIOUS_BLOCK_HASH);
+            }
+            _ => panic!("expected GetBlocks message"),
+        }
     }
 }
