@@ -7,8 +7,8 @@ use std::{
 
 use bitcoin::{BlockHash, Network};
 use bitcoinkernel::{
-    core::BlockHashExt, prelude::BlockValidationStateExt, ChainstateManager, Context,
-    ProcessBlockHeaderResult, ValidationMode,
+    core::BlockHashExt, prelude::BlockValidationStateExt, BlockTreeEntry, ChainstateManager,
+    Context, ProcessBlockHeaderResult, ValidationMode,
 };
 use log::{debug, info, warn};
 use p2p::{
@@ -25,6 +25,7 @@ use p2p::{
 use crate::kernel_util::{bitcoin_block_to_kernel_block, bitcoin_header_to_kernel_header};
 
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::INVALID_CB_NO_BAN_VERSION;
+const MAX_LOCATOR_HASHES: usize = 101;
 
 #[derive(Clone)]
 pub struct TipState {
@@ -61,6 +62,7 @@ impl NodeState {
 
 /// State Machine for setting up a connection and getting blocks from a peer
 ///
+/// ```text
 ///       [*]
 ///        │
 /// AwaitingHeaders
@@ -74,6 +76,7 @@ impl NodeState {
 ///       │ │
 ///       └─┘
 ///      Block
+/// ```
 #[derive(Default)]
 pub enum PeerStateMachine {
     #[default]
@@ -87,18 +90,48 @@ pub struct AwaitingBlock {
     pub block_buffer: HashMap<bitcoin::BlockHash /*prev */, bitcoinkernel::Block>,
 }
 
-fn create_getheaders_message(known_block_hash: bitcoin::BlockHash) -> NetworkMessage {
+fn build_block_locators(tip: BlockTreeEntry<'_>) -> Vec<BlockHash> {
+    let height = tip.height();
+    assert!(height >= 0);
+    let mut locators = Vec::with_capacity(MAX_LOCATOR_HASHES);
+    let mut entry = tip;
+    let mut current_height = height as usize;
+    let mut step: usize = 1;
+    loop {
+        let hash = BlockHash::from_byte_array(entry.block_hash().to_bytes());
+        locators.push(hash);
+        if current_height == 0 || locators.len() >= MAX_LOCATOR_HASHES {
+            break;
+        }
+        if locators.len() > 10 {
+            step *= 2;
+        }
+        let target = current_height.saturating_sub(step);
+        while current_height > target {
+            match entry.prev() {
+                Some(prev) => {
+                    entry = prev;
+                    current_height -= 1;
+                }
+                None => break,
+            }
+        }
+    }
+    locators
+}
+
+fn create_getheaders_message(locator_hashes: Vec<bitcoin::BlockHash>) -> NetworkMessage {
     NetworkMessage::GetHeaders(GetHeadersMessage {
         version: PROTOCOL_VERSION,
-        locator_hashes: vec![known_block_hash],
+        locator_hashes,
         stop_hash: bitcoin::BlockHash::GENESIS_PREVIOUS_BLOCK_HASH,
     })
 }
 
-fn create_getblocks_message(known_block_hash: bitcoin::BlockHash) -> NetworkMessage {
+fn create_getblocks_message(locator_hashes: Vec<bitcoin::BlockHash>) -> NetworkMessage {
     NetworkMessage::GetBlocks(GetBlocksMessage {
         version: PROTOCOL_VERSION,
-        locator_hashes: vec![known_block_hash],
+        locator_hashes,
         stop_hash: bitcoin::BlockHash::GENESIS_PREVIOUS_BLOCK_HASH,
     })
 }
@@ -152,24 +185,17 @@ pub fn process_message(
                 }
 
                 if headers.0.len() != 2000 {
-                    let tip_hash = node_state.get_tip_state().block_hash;
+                    let locators = build_block_locators(node_state.chainman.active_chain().tip());
                     return (
                         PeerStateMachine::AwaitingInv,
-                        vec![create_getblocks_message(tip_hash)],
+                        vec![create_getblocks_message(locators)],
                     );
                 }
 
-                let best_hash = BlockHash::from_byte_array(
-                    node_state
-                        .chainman
-                        .best_entry()
-                        .unwrap()
-                        .block_hash()
-                        .to_bytes(),
-                );
+                let locators = build_block_locators(node_state.chainman.best_entry().unwrap());
                 (
                     PeerStateMachine::AwaitingHeaders,
-                    vec![create_getheaders_message(best_hash)],
+                    vec![create_getheaders_message(locators)],
                 )
             }
             message => {
@@ -231,10 +257,10 @@ pub fn process_message(
                 // blocks.
                 if block_state.peer_inventory.is_empty() {
                     block_state.block_buffer.clear();
-                    let our_best = node_state.get_tip_state().block_hash;
+                    let locators = build_block_locators(node_state.chainman.active_chain().tip());
                     (
                         PeerStateMachine::AwaitingInv,
-                        vec![create_getblocks_message(our_best)],
+                        vec![create_getblocks_message(locators)],
                     )
                 } else {
                     (PeerStateMachine::AwaitingBlock(block_state), vec![])
@@ -279,23 +305,14 @@ impl BitcoinPeer {
 
         let addr = Address::new(&socket_addr, ServiceFlags::WITNESS);
         info!("Connected to {:?}", addr);
-        let state_machine = PeerStateMachine::AwaitingHeaders;
-        let best_hash = BlockHash::from_byte_array(
-            node_state
-                .chainman
-                .best_entry()
-                .unwrap()
-                .block_hash()
-                .to_bytes(),
-        );
-        let getheaders = create_getheaders_message(best_hash);
+        let locators = build_block_locators(node_state.chainman.best_entry().unwrap());
         debug!("sending headers message...");
-        writer.send_message(getheaders)?;
+        writer.send_message(create_getheaders_message(locators))?;
         let peer = BitcoinPeer {
             addr,
             writer: Arc::new(writer),
             reader,
-            state_machine,
+            state_machine: PeerStateMachine::AwaitingHeaders,
         };
         Ok(peer)
     }
