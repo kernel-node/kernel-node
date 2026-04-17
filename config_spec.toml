@@ -21,3 +21,9 @@ name = "daemon"
 type = "bool"
 default = "false"
 doc = "Run the server as a daemon"
+
+[[param]]
+name = "maxpeers"
+type = "usize"
+default = "4"
+doc = "Maximum number of concurrent peer connections during IBD."
