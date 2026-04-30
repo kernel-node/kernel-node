@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/wallet"]
+resolver = "2"
+
 [package]
 name = "kernel-node"
 version = "0.1.0"
@@ -15,6 +19,7 @@ configure_me = "0.4.0"
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.10"
+wallet = { path = "crates/wallet" }
 ## IPC required dependencies
 capnp = "0.25"
 capnp-rpc = "0.25"
