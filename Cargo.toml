@@ -20,6 +20,7 @@ clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.10"
 wallet = { path = "crates/wallet" }
+secp256k1 = "0.29"
 ## IPC required dependencies
 capnp = "0.25"
 capnp-rpc = "0.25"

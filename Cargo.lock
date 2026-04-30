@@ -633,6 +633,7 @@ dependencies = [
  "futures",
  "libc",
  "log",
+ "secp256k1",
  "tokio",
  "tokio-util",
  "wallet",
