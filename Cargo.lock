@@ -631,6 +631,7 @@ dependencies = [
  "configure_me_codegen",
  "env_logger",
  "futures",
+ "hex",
  "libc",
  "log",
  "secp256k1",
