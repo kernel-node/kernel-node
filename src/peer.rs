@@ -230,6 +230,21 @@ pub fn process_message(
                     (PeerStateMachine::AwaitingInv, vec![])
                 }
             }
+            NetworkMessage::Headers(headers) if !headers.is_empty() => {
+                let block_hashes: Vec<bitcoin::BlockHash> =
+                    headers.iter().map(|h| h.block_hash()).collect();
+                debug!(
+                    "Received {} header(s) as block announcement",
+                    block_hashes.len()
+                );
+                (
+                    PeerStateMachine::AwaitingBlock(AwaitingBlock {
+                        peer_inventory: block_hashes.iter().cloned().collect(),
+                        block_buffer: HashMap::new(),
+                    }),
+                    vec![create_getdata_message(&block_hashes)],
+                )
+            }
             message => {
                 debug!("Ignoring message: {:?}", message);
                 (PeerStateMachine::AwaitingInv, vec![])

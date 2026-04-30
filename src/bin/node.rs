@@ -10,29 +10,34 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bitcoin::consensus::deserialize as btc_deserialize;
 use bitcoin::p2p::{
     address::{AddrV2, AddrV2Message},
     ServiceFlags,
 };
 use bitcoin::{hashes::Hash, BlockHash, Network};
 use bitcoinkernel::{
-    core::BlockHashExt, prelude::BlockValidationStateExt, ChainType, ChainstateManagerBuilder,
-    Context, ContextBuilder, Log, Logger, SynchronizationState, ValidationMode,
+    core::BlockHashExt,
+    prelude::{
+        BlockSpentOutputsExt, BlockValidationStateExt, CoinExt, ScriptPubkeyExt,
+        TransactionSpentOutputsExt, TxOutExt,
+    },
+    ChainType, ChainstateManager, ChainstateManagerBuilder, Context, ContextBuilder, Log, Logger,
+    SynchronizationState, ValidationMode,
 };
 use kernel_node::{
     daemonize::Daemonize,
-    kernel_util::NetworkExt,
+    ipc::{IpcInterface, WalletIpcInterface, WalletState},
+    kernel_util::{ChainExt, DirnameExt, NetworkExt},
     peer::{BitcoinPeer, NodeState, TipState},
-};
-use kernel_node::{
-    ipc::IpcInterface,
-    kernel_util::{ChainExt, DirnameExt},
     server_capnp::server,
+    wallet_capnp::wallet as wallet_ipc,
 };
 use log::{debug, error, info, warn};
 use p2p::dns::{BITCOIN_SEEDS, SIGNET_SEEDS, TESTNET3_SEEDS, TESTNET4_SEEDS};
 use tokio::net::UnixListener;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use wallet::silentpayments::{build_receiver, scan_block, InputData, Network as WalletNetwork};
 
 const TABLE_WIDTH: usize = 16;
 const TABLE_SLOT: usize = 16;
@@ -43,6 +48,113 @@ const DNS_RESOLVER: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
 const STALE_BLOCK_DURATION: Duration = Duration::from_secs(60 * 20);
 
 configure_me::include_config!();
+
+fn to_wallet_network(network: Network) -> WalletNetwork {
+    match network {
+        Network::Bitcoin => WalletNetwork::Mainnet,
+        Network::Regtest => WalletNetwork::Regtest,
+        _ => WalletNetwork::Testnet,
+    }
+}
+
+fn scan_kernel_block(
+    chainman: &ChainstateManager,
+    kernel_block: &bitcoinkernel::Block,
+    wallet_state: &WalletState,
+) {
+    let scan_key = match *wallet_state.scan_key.lock().unwrap() {
+        Some(k) => k,
+        None => return,
+    };
+    let spend_key = match *wallet_state.spend_key.lock().unwrap() {
+        Some(k) => k,
+        None => return,
+    };
+
+    let receiver = match build_receiver(&scan_key, spend_key, wallet_state.network) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("build_receiver failed: {e}");
+            return;
+        }
+    };
+
+    let entry = chainman.active_chain().tip();
+    let block_height = entry.height() as u32;
+
+    let undo = match chainman.read_spent_outputs(&entry) {
+        Ok(u) => u,
+        Err(e) => {
+            warn!("read_spent_outputs failed at height {block_height}: {e}");
+            return;
+        }
+    };
+
+    let raw = match kernel_block.consensus_encode() {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("consensus_encode failed: {e}");
+            return;
+        }
+    };
+    let btc_block: bitcoin::Block = match btc_deserialize(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("block deserialize failed: {e}");
+            return;
+        }
+    };
+
+    // undo[i] corresponds to btc_block.txdata[i+1] (coinbase has no undo entry).
+    let mut tx_input_data: Vec<Vec<InputData>> = Vec::new();
+    for (undo_idx, tx_spent) in undo.iter().enumerate() {
+        let btc_tx = match btc_block.txdata.get(undo_idx + 1) {
+            Some(t) => t,
+            None => break,
+        };
+        let mut inputs = Vec::new();
+        for (input_idx, btc_input) in btc_tx.input.iter().enumerate() {
+            if let Ok(coin) = tx_spent.coin(input_idx) {
+                inputs.push(InputData {
+                    script_sig: btc_input.script_sig.as_bytes().to_vec(),
+                    witness: btc_input.witness.iter().map(|item| item.to_vec()).collect(),
+                    prevout_script: coin.output().script_pubkey().to_bytes(),
+                    txid: btc_input.previous_output.txid.to_string(),
+                    vout: btc_input.previous_output.vout,
+                });
+            }
+        }
+        tx_input_data.push(inputs);
+    }
+
+    let payments = scan_block(&receiver, &scan_key, &btc_block, tx_input_data);
+    if payments.is_empty() {
+        return;
+    }
+
+    let found: Vec<(bitcoin::Txid, usize, bitcoin::Amount)> = payments
+        .iter()
+        .filter_map(|(txid, payment)| {
+            btc_block
+                .txdata
+                .iter()
+                .find(|tx| tx.compute_txid() == *txid)
+                .and_then(|tx| tx.output.get(payment.output_index))
+                .map(|out| (*txid, payment.output_index, out.value))
+        })
+        .collect();
+
+    wallet_state
+        .wallet
+        .lock()
+        .unwrap()
+        .process_block(&btc_block, block_height, &found);
+    info!(
+        "Wallet: found {} silent payment(s) at height {}",
+        found.len(),
+        block_height
+    );
+}
 
 fn create_context(
     chain_type: ChainType,
@@ -87,7 +199,6 @@ fn create_context(
                     shutdown_tx_clone.send(()).expect("failed to send shutdown signal");
                 }
         })
-        // .with_block_checked_validation(setup_validation_interface(tip_state))
         .with_block_checked_validation(move |block: bitcoinkernel::Block, state: bitcoinkernel::BlockValidationStateRef<'_>| {
             match state.mode() {
                 ValidationMode::Valid => {
@@ -107,7 +218,7 @@ struct KernelLog {}
 impl Log for KernelLog {
     fn log(&self, message: &str) {
         log::info!(
-            target: "bitcoinkernel", 
+            target: "bitcoinkernel",
             "{}", message.strip_suffix("\r\n").or_else(|| message.strip_suffix('\n')).unwrap_or(message));
     }
 }
@@ -122,22 +233,6 @@ fn setup_logging() {
 
     unsafe { GLOBAL_LOG_CALLBACK_HOLDER = Some(Logger::new(KernelLog {}).unwrap()) };
 }
-
-// fn setup_validation_interface(
-//     tip_state: &Arc<Mutex<TipState>>,
-// ) -> Box<ValidationInterfaceCallbacks> {
-//     let tip_state_clone = Arc::clone(&tip_state);
-//     Box::new(ValidationInterfaceCallbacks {
-//         block_checked: Box::new(move |block, mode, _result| match mode {
-//             ValidationMode::Valid => {
-//                 let hash = bitcoin::BlockHash::from_byte_array(block.get_hash().hash);
-//                 log::debug!("Validation interface: Successfully checked block: {}", hash);
-//                 tip_state_clone.lock().unwrap().block_hash = hash;
-//             }
-//             _ => error!("Received an invalid block!"),
-//         }),
-//     })
-// }
 
 fn resolve_seeds(network: Network) -> Vec<IpAddr> {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -172,6 +267,7 @@ fn run(
     shutdown_rx: mpsc::Receiver<()>,
     addr_rx: mpsc::Receiver<Vec<AddrV2Message>>,
     block_rx: mpsc::Receiver<bitcoinkernel::Block>,
+    wallet_state: WalletState,
 ) -> std::io::Result<()> {
     let mut table = addrman::Table::<TABLE_WIDTH, TABLE_SLOT, MAX_BUCKETS>::new();
     match connect {
@@ -305,7 +401,10 @@ fn run(
                 Ok(block) => {
                     debug!("Validating block.");
                     last_block = Instant::now();
-                    let _ = chainman.process_block(&block);
+                    let result = chainman.process_block(&block);
+                    if result.is_new_block() {
+                        scan_kernel_block(&chainman, &block, &wallet_state);
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if last_block.elapsed() > STALE_BLOCK_DURATION {
@@ -403,6 +502,12 @@ fn main() {
         return;
     }
 
+    let wallet_state = WalletState::new(to_wallet_network(network));
+
+    let node_sock_file = data_dir.clone() + "/node.sock";
+    let wallet_sock_file = data_dir.clone() + "/wallet.sock";
+
+    let wallet_state_for_ipc = wallet_state.clone();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -411,13 +516,36 @@ fn main() {
         rt.block_on(async move {
             tokio::task::LocalSet::new()
                 .run_until(async move {
-                    let sock_file = data_dir + "/node.sock";
-                    let _ = std::fs::remove_file(&sock_file);
+                    let _ = std::fs::remove_file(&node_sock_file);
+                    let _ = std::fs::remove_file(&wallet_sock_file);
                     info!("Listening for incoming IPC requests");
-                    let unix_socket = UnixListener::bind(sock_file).unwrap();
+                    let node_unix_socket = UnixListener::bind(&node_sock_file).unwrap();
+                    let wallet_unix_socket = UnixListener::bind(&wallet_sock_file).unwrap();
+
+                    tokio::task::spawn_local(async move {
+                        loop {
+                            let stream = wallet_unix_socket.accept().await.unwrap().0;
+                            let state = wallet_state_for_ipc.clone();
+                            let (reader, writer) = stream.into_split();
+                            let buf_reader = futures::io::BufReader::new(reader.compat());
+                            let buf_writer = futures::io::BufWriter::new(writer.compat_write());
+                            let network = capnp_rpc::twoparty::VatNetwork::new(
+                                buf_reader,
+                                buf_writer,
+                                capnp_rpc::rpc_twoparty_capnp::Side::Server,
+                                Default::default(),
+                            );
+                            let client: wallet_ipc::Client =
+                                capnp_rpc::new_client(WalletIpcInterface::new(state));
+                            let rpc_system =
+                                capnp_rpc::RpcSystem::new(Box::new(network), Some(client.client));
+                            tokio::task::spawn_local(rpc_system);
+                        }
+                    });
+
                     loop {
                         let stream = tokio::select! {
-                            unix_bind_res = unix_socket.accept() => {
+                            unix_bind_res = node_unix_socket.accept() => {
                                 unix_bind_res.unwrap().0
                             }
                             _ctrl_c = tokio::signal::ctrl_c() => {
@@ -447,5 +575,14 @@ fn main() {
         })
     });
 
-    run(network, connect, node_state, shutdown_rx, addr_rx, block_rx).unwrap()
+    run(
+        network,
+        connect,
+        node_state,
+        shutdown_rx,
+        addr_rx,
+        block_rx,
+        wallet_state,
+    )
+    .unwrap()
 }
