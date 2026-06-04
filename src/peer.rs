@@ -3,6 +3,7 @@ use std::{
     fmt,
     net::SocketAddr,
     sync::{mpsc, Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use bitcoin::{
@@ -33,6 +34,7 @@ use crate::{
 const PROTOCOL_VERSION: ProtocolVersion = 70015;
 const MAX_LOCATOR_HASHES: usize = 101;
 const DOWNLOAD_BATCH_SIZE: usize = 16;
+const PEER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct TipState {
@@ -481,11 +483,16 @@ pub fn process_message(
     }
 }
 
+fn stalled(state: &PeerStateMachine, last_progress: Instant) -> bool {
+    !matches!(state, PeerStateMachine::AwaitingInv) && last_progress.elapsed() > PEER_STALL_TIMEOUT
+}
+
 pub struct BitcoinPeer {
     addr: Address,
     writer: Arc<ConnectionWriter>,
     reader: ConnectionReader,
     state_machine: PeerStateMachine,
+    last_progress: Instant,
 }
 
 impl fmt::Display for BitcoinPeer {
@@ -520,12 +527,17 @@ impl BitcoinPeer {
             writer: Arc::new(writer),
             reader,
             state_machine: PeerStateMachine::AwaitingHeaders,
+            last_progress: Instant::now(),
         };
         Ok(peer)
     }
 
     pub fn writer(&self) -> Arc<ConnectionWriter> {
         Arc::clone(&self.writer)
+    }
+
+    pub fn is_stalled(&self) -> bool {
+        stalled(&self.state_machine, self.last_progress)
     }
 
     pub fn release_in_flight(&self, download: &Mutex<DownloadState>) {
@@ -549,9 +561,16 @@ impl BitcoinPeer {
         node_state: &NodeState,
     ) -> Result<(), p2p::net::Error> {
         let msg = self.receive_message()?;
+        let received_progress =
+            matches!(msg, NetworkMessage::Block(_) | NetworkMessage::Headers(_));
+        let was_awaiting_block = matches!(self.state_machine, PeerStateMachine::AwaitingBlock(_));
         let old_state = std::mem::take(&mut self.state_machine);
         let (peer_state_machine, mut messages) = process_message(old_state, msg, node_state);
         self.state_machine = peer_state_machine;
+        let now_awaiting_block = matches!(self.state_machine, PeerStateMachine::AwaitingBlock(_));
+        if received_progress || (now_awaiting_block && !was_awaiting_block) {
+            self.last_progress = Instant::now();
+        }
         for message in messages.drain(..) {
             self.writer.send_message(message)?
         }
@@ -661,6 +680,33 @@ mod tests {
             d.pop_batch(5),
             vec![hash(1), hash(2), hash(3), hash(4), hash(5)]
         );
+    }
+
+    fn long_ago() -> Instant {
+        Instant::now() - PEER_STALL_TIMEOUT - Duration::from_secs(1)
+    }
+
+    #[test]
+    fn stalled_when_awaiting_headers_past_timeout() {
+        assert!(stalled(&PeerStateMachine::AwaitingHeaders, long_ago()));
+    }
+
+    #[test]
+    fn stalled_when_awaiting_block_past_timeout() {
+        let state = PeerStateMachine::AwaitingBlock(AwaitingBlock {
+            peer_inventory: HashSet::new(),
+        });
+        assert!(stalled(&state, long_ago()));
+    }
+
+    #[test]
+    fn not_stalled_when_awaiting_inv() {
+        assert!(!stalled(&PeerStateMachine::AwaitingInv, long_ago()));
+    }
+
+    #[test]
+    fn not_stalled_with_recent_progress() {
+        assert!(!stalled(&PeerStateMachine::AwaitingHeaders, Instant::now()));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::{
 };
 
 use bitcoin::{p2p::address::AddrV2, Network};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use p2p::net::ConnectionWriter;
 
 use crate::{
@@ -119,6 +119,10 @@ impl PeerManager {
 
                     info!(target: Category::NET, "Peer thread {}: connected to {}", i, peer);
                     while running.load(Ordering::SeqCst) {
+                        if peer.is_stalled() {
+                            warn!(target: Category::NET, "Peer thread {}: stalled, disconnecting {}", i, peer);
+                            break;
+                        }
                         if let Err(e) = peer.receive_and_process_message(&node_state) {
                             match e {
                                 p2p::net::Error::Io(io)
