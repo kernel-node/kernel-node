@@ -26,7 +26,7 @@ const MAX_BUCKETS: usize = 4;
 
 pub type AddrTable = addrman::Table<TABLE_WIDTH, TABLE_SLOT, MAX_BUCKETS>;
 
-const DEFAULT_MAX_PEERS: usize = 1;
+const DEFAULT_MAX_PEERS: usize = 8;
 
 /// Consecutive one second waits on an empty address book before giving up.
 /// Nothing refills it without a working network, so waiting longer only
@@ -157,6 +157,7 @@ impl PeerManager {
                         }
                     }
 
+                    peer.release_in_flight(&node_state.download);
                     connected_peers.lock().unwrap().remove(&socket_addr);
                     *writer_slot_thread.lock().unwrap() = None;
                 }
