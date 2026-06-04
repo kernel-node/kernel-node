@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::DerefMut,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -27,7 +27,8 @@ use kernel_node::{
     ext::{ChainExt, DirnameExt, NetworkExt},
     ipc::IpcInterface,
     logging::Category,
-    peer::{BitcoinPeer, NodeState, TipState},
+    peer::{DownloadState, NodeState, TipState},
+    peer_manager::PeerManager,
     resolve_seeds,
     server_capnp::server,
     FatalShutdown, ScanEvent,
@@ -266,7 +267,7 @@ fn broadcast_transaction(
 fn run(
     network: Network,
     connect: Option<SocketAddr>,
-    mut node_state: NodeState,
+    node_state: NodeState,
     shutdown_rx: mpsc::Receiver<()>,
     addr_rx: mpsc::Receiver<Vec<AddrV2Message>>,
     block_rx: mpsc::Receiver<bitcoinkernel::Block>,
@@ -323,68 +324,20 @@ fn run(
     let addrman = Arc::new(Mutex::new(table));
     let addrman_for_feelers = Arc::clone(&addrman);
     let wallet_for_broadcast = Arc::clone(&wallet);
+    let node_state = Arc::new(node_state);
 
     let running = Arc::new(AtomicBool::new(true));
     let running_addr = running.clone();
-    let running_peer = running.clone();
     let running_block = running.clone();
     let running_scan = running.clone();
     let running_feelers = running.clone();
 
-    let peer_source = Arc::clone(&addrman);
-    let kill = Arc::new(Mutex::new(None));
-    let writer = Arc::clone(&kill);
-    let stale_block_kill = Arc::clone(&kill);
-
-    let peer_processing_handler = thread::spawn(move || {
-        info!(target: Category::NODE, "Starting net processing thread.");
-        while running_peer.load(Ordering::SeqCst) {
-            let socket_addr = if let Some(addr) = connect {
-                Some(addr)
-            } else {
-                let addr_lock = peer_source.lock().unwrap();
-                let (address, port) = addr_lock.select().unwrap().network_addr();
-                match address {
-                    AddrV2::Ipv4(ipv4) => Some(SocketAddr::V4(SocketAddrV4::new(ipv4, port))),
-                    AddrV2::Ipv6(ipv6) => Some(SocketAddr::from((ipv6, port))),
-                    _ => None,
-                }
-            };
-            let Some(socket_addr) = socket_addr else {
-                continue;
-            };
-            let peer = BitcoinPeer::new(socket_addr, network, &mut node_state);
-            let mut peer = match peer {
-                Ok(connection) => {
-                    let mut writer_lock = writer.lock().unwrap();
-                    *writer_lock = Some(connection.writer());
-                    connection
-                }
-                Err(e) => {
-                    error!(target: Category::NET, "Could not connect: {e}");
-                    std::thread::sleep(Duration::from_millis(500));
-                    continue;
-                }
-            };
-            if !running_peer.load(Ordering::SeqCst) {
-                break;
-            }
-            loop {
-                if let Err(e) = peer.receive_and_process_message(&mut node_state) {
-                    match e {
-                        p2p::net::Error::Io(io) => {
-                            if io.kind() != std::io::ErrorKind::UnexpectedEof {
-                                error!(target: Category::NET, "Unexpected I/O error: {}", io);
-                            }
-                        }
-                        e => error!(target: Category::NET, "Error processing message: {e}"),
-                    }
-                    break;
-                }
-            }
-        }
-        info!(target: Category::NODE, "Stopping net processing thread.");
-    });
+    let mut peer_manager = PeerManager::new(Arc::clone(&addrman), Arc::clone(&node_state), network);
+    if connect.is_some() {
+        peer_manager = peer_manager.max_peers(1);
+    }
+    peer_manager.start();
+    let peer_writers = peer_manager.peer_writers().to_vec();
 
     let addr_processing_handler = thread::spawn(move || {
         info!(target: Category::NODE, "Starting addr processing thread.");
@@ -422,10 +375,11 @@ fn run(
                 Err(RecvTimeoutError::Timeout) => {
                     if last_block.elapsed() > STALE_BLOCK_DURATION {
                         last_block = Instant::now();
-                        info!(target: Category::NET, "Potential stale block. Finding a new peer.");
-                        let mut peer_lock = stale_block_kill.lock().unwrap();
-                        if let Some(conn) = peer_lock.deref_mut() {
-                            let _ = conn.shutdown();
+                        info!(target: Category::NET, "Potential stale block. Dropping peers to find new ones.");
+                        for slot in &peer_writers {
+                            if let Some(conn) = slot.lock().unwrap().deref_mut() {
+                                let _ = conn.shutdown();
+                            }
                         }
                     }
                     continue;
@@ -523,17 +477,14 @@ fn run(
         info!(target: Category::NODE, "Received shutdown signal, shutting down...");
         running.store(false, Ordering::SeqCst);
         context.interrupt().unwrap();
-        let mut peer_lock = kill.lock().unwrap();
-        if let Some(conn) = peer_lock.deref_mut() {
-            conn.shutdown().unwrap()
-        }
+        peer_manager.stop();
     }
 
     addr_processing_handler.join().unwrap();
-    peer_processing_handler.join().unwrap();
     block_processing_handler.join().unwrap();
     scan_processing_handler.join().unwrap();
     feeler_thread.join().unwrap();
+    peer_manager.join();
 
     info!(target: Category::NODE, "Exiting.");
     Ok(())
@@ -641,6 +592,7 @@ fn main() {
         tip_state,
         chainman,
         context: Arc::clone(&context),
+        download: Mutex::new(DownloadState::default()),
     };
 
     if let Err(err) = node_state.chainman.import_blocks() {
@@ -651,6 +603,7 @@ fn main() {
     let tip_index = node_state.chainman.active_chain().tip();
     let hash = tip_index.block_hash();
     node_state.set_tip_state(BlockHash::from_byte_array(hash.to_bytes()));
+    node_state.seed_download_tip(BlockHash::from_byte_array(hash.to_bytes()));
 
     info!(target: Category::KERNEL, "Bitcoin kernel initialized");
 
