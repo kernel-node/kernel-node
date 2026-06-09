@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
-use bdk_coin_select::metrics::LowestFee;
 use bdk_coin_select::{
     Candidate, ChangePolicy, CoinSelector, Drain, DrainWeights, Target, TargetFee, TargetOutputs,
 };
@@ -22,8 +21,6 @@ use silentpayments::{Network, SilentPaymentAddress};
 
 use crate::silentpayments::wallet::{Coin, Wallet};
 
-const LONG_TERM_FEERATE_SAT_PER_VB: f32 = 1.0;
-
 #[derive(Debug)]
 pub enum SendError {
     WatchOnly,
@@ -33,6 +30,7 @@ pub enum SendError {
     NetworkMismatch,
     InvalidRecipient(String),
     OutputDerivation,
+    InvalidSignature,
     SilentPayments(::silentpayments::Error),
     Secp(secp256k1::Error),
     Sighash(bitcoin::sighash::TaprootError),
@@ -62,6 +60,9 @@ impl fmt::Display for SendError {
             }
             SendError::InvalidRecipient(e) => write!(f, "invalid recipient address: {e}"),
             SendError::OutputDerivation => write!(f, "recipient output key was not derived"),
+            SendError::InvalidSignature => {
+                write!(f, "signature does not verify against the coin being spent")
+            }
             SendError::SilentPayments(e) => write!(f, "silent payments error: {e}"),
             SendError::Secp(e) => write!(f, "secp256k1 error: {e}"),
             SendError::Sighash(e) => write!(f, "sighash error: {e}"),
@@ -182,7 +183,7 @@ fn build_transaction(
     if coins.is_empty() {
         return Err(SendError::NoSpendableCoins);
     }
-    let secp = Secp256k1::signing_only();
+    let secp = Secp256k1::new();
 
     let recipient_script = match &recipient {
         Recipient::Address(address) => Some(address.script_pubkey()),
@@ -209,14 +210,9 @@ fn build_transaction(
         fee: TargetFee::from_feerate(feerate),
         outputs: TargetOutputs::fund_outputs([(recipient_weight, amount.to_sat())]),
     };
-    let change_policy = ChangePolicy::min_value_and_waste(
-        DrainWeights::TR_KEYSPEND,
-        change_dust.to_sat(),
-        feerate,
-        bdk_coin_select::FeeRate::from_sat_per_vb(LONG_TERM_FEERATE_SAT_PER_VB),
-    );
+    let change_policy = ChangePolicy::min_value(DrainWeights::TR_KEYSPEND, change_dust.to_sat());
 
-    let (mut selected, drain) = select_coins(coins, target, change_policy, 100_000)?;
+    let (mut selected, drain) = select_coins(coins, target, change_policy)?;
     let mut rng = bitcoin::secp256k1::rand::thread_rng();
     selected.shuffle(&mut rng);
 
@@ -290,10 +286,10 @@ fn build_transaction(
         })
         .collect();
 
-    debug_assert_eq!(signing_keys.len(), prevouts.len());
+    assert_eq!(signing_keys.len(), prevouts.len());
     let mut cache = SighashCache::new(&tx);
     let mut witnesses = Vec::with_capacity(selected.len());
-    for (i, signing_key) in signing_keys.iter().enumerate() {
+    for (i, (signing_key, prevout)) in signing_keys.iter().zip(&prevouts).enumerate() {
         let sighash = cache.taproot_key_spend_signature_hash(
             i,
             &Prevouts::All(&prevouts),
@@ -302,6 +298,9 @@ fn build_transaction(
         let keypair = Keypair::from_secret_key(&secp, signing_key);
         let message = Message::from_digest(sighash.to_byte_array());
         let signature = secp.sign_schnorr_no_aux_rand(&message, &keypair);
+        let output_key = p2tr_output_key(&prevout.script_pubkey)?;
+        secp.verify_schnorr(&signature, &message, &output_key)
+            .map_err(|_| SendError::InvalidSignature)?;
         let sig = taproot::Signature {
             signature,
             sighash_type: TapSighashType::Default,
@@ -319,7 +318,6 @@ fn select_coins<'a, 'c>(
     coins: &'c [SpendableCoin<'a>],
     target: Target,
     change_policy: ChangePolicy,
-    max_bnb_rounds: usize,
 ) -> Result<(Vec<&'c SpendableCoin<'a>>, Drain), SendError> {
     let spendable: Vec<&SpendableCoin> = coins.iter().collect();
     let candidates: Vec<Candidate> = spendable
@@ -328,23 +326,24 @@ fn select_coins<'a, 'c>(
         .collect();
 
     let mut selector = CoinSelector::new(&candidates);
-    let metric = LowestFee {
-        target,
-        long_term_feerate: bdk_coin_select::FeeRate::from_sat_per_vb(LONG_TERM_FEERATE_SAT_PER_VB),
-        change_policy,
-    };
-    if selector.run_bnb(metric, max_bnb_rounds).is_err() {
-        selector.sort_candidates_by_descending_value_pwu();
-        selector.select_until_target_met(target).map_err(|e| {
-            let available = coins
-                .iter()
-                .map(|c| c.coin.value.to_sat())
-                .fold(0u64, u64::saturating_add);
-            SendError::InsufficientFunds {
-                needed: Amount::from_sat(available.saturating_add(e.missing)),
-                available: Amount::from_sat(available),
-            }
-        })?;
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.shuffle(&mut bitcoin::secp256k1::rand::thread_rng());
+    for index in order {
+        if selector.is_target_met(target) {
+            break;
+        }
+        selector.select(index);
+    }
+    if !selector.is_target_met(target) {
+        let available = coins
+            .iter()
+            .map(|c| c.coin.value.to_sat())
+            .fold(0u64, u64::saturating_add);
+        let missing = selector.excess(target, Drain::NONE).unsigned_abs();
+        return Err(SendError::InsufficientFunds {
+            needed: Amount::from_sat(available.saturating_add(missing)),
+            available: Amount::from_sat(available),
+        });
     }
     let drain = selector.drain(target, change_policy);
     let selected = selector.apply_selection(&spendable).copied().collect();
@@ -356,8 +355,9 @@ fn cs_feerate(fee_rate: FeeRate) -> bdk_coin_select::FeeRate {
 }
 
 fn output_weight(script_len: usize) -> Weight {
-    // 8-byte value, 1-byte length prefix, then the script, times 4 weight units per byte.
-    Weight::from_wu_usize((8 + 1 + script_len) * 4)
+    // An output is 8 bytes of value, a 1-byte length prefix, then the script.
+    let vbytes = u64::try_from(8 + 1 + script_len).expect("output size fits in u64");
+    Weight::from_vb_unchecked(vbytes)
 }
 
 fn sp_output_script(
@@ -375,9 +375,16 @@ fn p2tr_script(output_key: XOnlyPublicKey) -> ScriptBuf {
     ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(output_key))
 }
 
-fn p2tr_dust(spend_secret: &SecretKey, secp: &Secp256k1<secp256k1::SignOnly>) -> Amount {
+fn p2tr_dust<C: secp256k1::Signing>(spend_secret: &SecretKey, secp: &Secp256k1<C>) -> Amount {
     let probe = spend_secret.x_only_public_key(secp).0;
     p2tr_script(probe).minimal_non_dust()
+}
+
+fn p2tr_output_key(script: &ScriptBuf) -> Result<XOnlyPublicKey, SendError> {
+    if !script.is_p2tr() {
+        return Err(SendError::InvalidSignature);
+    }
+    XOnlyPublicKey::from_slice(&script.as_bytes()[2..]).map_err(SendError::Secp)
 }
 
 #[cfg(test)]
@@ -589,97 +596,89 @@ mod tests {
     }
 
     #[test]
-    fn fallback_selects_largest_first() {
-        let spend_secret = even_secret([0x02; 32]);
-        let owned: Vec<(OutPoint, Coin)> = [30_000u64, 20_000, 10_000, 5_000]
-            .iter()
-            .enumerate()
-            .map(|(i, value)| {
-                let tweak = Scalar::from_be_bytes([i as u8 + 1; 32]).unwrap();
-                let outpoint = OutPoint {
-                    txid: Txid::from_byte_array([0xab; 32]),
-                    vout: i as u32,
-                };
-                (
-                    outpoint,
-                    owned_coin(&spend_secret, tweak, Amount::from_sat(*value)),
-                )
-            })
-            .collect();
-        let coins: Vec<SpendableCoin> = owned
-            .iter()
-            .map(|(outpoint, coin)| SpendableCoin {
-                outpoint: *outpoint,
-                coin,
-            })
-            .collect();
-
-        let amount = Amount::from_sat(45_000);
-        let target = Target {
-            fee: TargetFee::from_feerate(cs_feerate(FeeRate::from_sat_per_vb(2).unwrap())),
-            outputs: TargetOutputs::fund_outputs([(
-                DrainWeights::TR_KEYSPEND.output_weight,
-                amount.to_sat(),
-            )]),
-        };
-        let change_policy = ChangePolicy::min_value(DrainWeights::TR_KEYSPEND, 330);
-
-        // max_bnb_rounds = 0 skips branch and bound, forcing the largest-first fallback.
-        let (selected, _) = select_coins(&coins, target, change_policy, 0).unwrap();
-
-        let mut values: Vec<u64> = selected.iter().map(|c| c.coin.value.to_sat()).collect();
-        values.sort_unstable();
-        assert_eq!(values, vec![20_000, 30_000]);
-    }
-
-    #[test]
-    fn absorbs_uneconomical_change_at_high_feerate() {
+    fn scans_and_spends_a_received_output() {
         let secp = Secp256k1::new();
-        let scan_secret = even_secret([0x01; 32]);
-        let spend_secret = even_secret([0x02; 32]);
-        let change_address = build_receiver(
+
+        let scan_secret = even_secret([0x11; 32]);
+        let spend_secret = even_secret([0x22; 32]);
+        let receiver = build_receiver(
             &scan_secret,
             spend_secret.public_key(&secp),
             Network::Regtest,
         )
-        .unwrap()
-        .get_change_address();
-        let recipient = address(even_secret([0x03; 32]), even_secret([0x04; 32]));
+        .unwrap();
+        let sp_address = receiver.get_receiving_address();
 
-        let owned: Vec<Coin> = [55_000u64, 30_000, 20_000]
-            .iter()
-            .enumerate()
-            .map(|(i, value)| {
-                let tweak = Scalar::from_be_bytes([i as u8 + 1; 32]).unwrap();
-                owned_coin(&spend_secret, tweak, Amount::from_sat(*value))
-            })
-            .collect();
-        let coins: Vec<SpendableCoin> = owned
-            .iter()
-            .enumerate()
-            .map(|(i, coin)| SpendableCoin {
-                outpoint: OutPoint {
-                    txid: Txid::from_byte_array([0xab; 32]),
-                    vout: i as u32,
-                },
-                coin,
-            })
-            .collect();
-
-        let tx = build_transaction(
-            &spend_secret,
-            Recipient::SilentPayment(recipient),
-            Amount::from_sat(50_000),
-            FeeRate::from_sat_per_vb(30).unwrap(),
-            0,
-            change_address,
-            &coins,
+        let sender_key = even_secret([0x33; 32]);
+        let sender_prevout = p2tr_script(sender_key.x_only_public_key(&secp).0);
+        let funding = OutPoint {
+            txid: Txid::from_byte_array([0xcd; 32]),
+            vout: 0,
+        };
+        let partial_secret = calculate_partial_secret(
+            &[(sender_key, true)],
+            &[(funding.txid.to_string(), funding.vout)],
         )
         .unwrap();
+        let derived = generate_recipient_pubkeys(vec![sp_address], partial_secret).unwrap();
+        let output_key = *derived.get(&sp_address).unwrap().first().unwrap();
 
+        let sender_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: funding,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::from_slice(&[vec![0u8; 64]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: p2tr_script(output_key),
+            }],
+        };
+
+        let inputs = vec![crate::silentpayments::InputData {
+            script_sig: vec![],
+            witness: vec![vec![0u8; 64]],
+            prevout_script: sender_prevout.to_bytes(),
+            txid: funding.txid.to_string(),
+            vout: funding.vout,
+        }];
+        let found =
+            crate::silentpayments::scan_transaction(&receiver, &scan_secret, &inputs, &sender_tx);
+        assert_eq!(found.len(), 1, "receiver should detect the payment");
+        let (out_idx, tweak, _) = found[0];
+        assert_eq!(out_idx, 0);
+
+        let mut wallet = Wallet::new(Network::Regtest);
+        wallet
+            .import_signing_keys(scan_secret, spend_secret)
+            .unwrap();
+        wallet.utxos.insert(
+            OutPoint {
+                txid: sender_tx.compute_txid(),
+                vout: 0,
+            },
+            Coin {
+                value: Amount::from_sat(100_000),
+                script_pubkey: sender_tx.output[0].script_pubkey.clone(),
+                tweak,
+                label: None,
+                block_height: 1,
+                spent_by: None,
+            },
+        );
+
+        let recipient = address(even_secret([0x44; 32]), even_secret([0x55; 32]));
+        let tx = wallet
+            .build_transaction(
+                Recipient::SilentPayment(recipient),
+                Amount::from_sat(50_000),
+                FeeRate::from_sat_per_vb(2).unwrap(),
+            )
+            .unwrap();
         assert_eq!(tx.input.len(), 1);
-        assert_eq!(tx.output.len(), 1);
-        assert_eq!(tx.output[0].value, Amount::from_sat(50_000));
     }
 
     #[test]
