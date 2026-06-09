@@ -80,6 +80,15 @@ enum WalletCmd {
         /// Hex-encoded raw transaction.
         tx: String,
     },
+    /// Send to a silent payment address or a bitcoin address.
+    SendToAddress {
+        /// The recipient silent payment address or bitcoin address.
+        address: String,
+        /// Amount to send, in satoshis.
+        amount_sat: u64,
+        /// Fee rate, in satoshis per virtual byte.
+        fee_rate_sat_per_vb: f64,
+    },
 }
 
 fn generate_keys() -> (SecretKey, SecretKey, XOnlyPublicKey) {
@@ -215,6 +224,20 @@ fn main() {
                         let raw_bytes = Vec::<u8>::from_hex(&tx).expect("tx must be valid hex");
                         let mut req = client.broadcast_raw_tx_request();
                         req.get().set_tx(&raw_bytes);
+                        let result = req.send().promise.await.unwrap();
+                        let r = result.get().unwrap();
+                        let txid = r.get_txid().unwrap().to_string().unwrap();
+                        println!("{}", txid);
+                    }
+                    WalletCmd::SendToAddress {
+                        address,
+                        amount_sat,
+                        fee_rate_sat_per_vb,
+                    } => {
+                        let mut req = client.send_to_address_request();
+                        req.get().set_address(&address);
+                        req.get().set_amount_sat(amount_sat);
+                        req.get().set_fee_rate_sat_per_vb(fee_rate_sat_per_vb);
                         let result = req.send().promise.await.unwrap();
                         let r = result.get().unwrap();
                         let txid = r.get_txid().unwrap().to_string().unwrap();

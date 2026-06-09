@@ -6,4 +6,5 @@ interface Wallet {
     getHistory  @2 () -> (entries :Text);
     receive     @3 () -> (address :Text);
     broadcastRawTx @4 (tx :Data) -> (txid :Text);
+    sendToAddress @5 (address :Text, amountSat :UInt64, feeRateSatPerVb :Float64) -> (txid :Text);
 }
