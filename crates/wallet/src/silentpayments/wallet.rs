@@ -3,7 +3,7 @@ use std::{
     fmt,
 };
 
-use bitcoin::secp256k1::{Parity, PublicKey, Scalar, SecretKey, XOnlyPublicKey};
+use bitcoin::secp256k1::{Parity, PublicKey, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
 use bitcoin::{hashes::Hash, Amount, OutPoint, ScriptBuf, Txid};
 use bitcoinkernel::prelude::{TransactionExt, TxInExt, TxOutPointExt, TxidExt};
 
@@ -81,8 +81,10 @@ pub struct Wallet {
     pub scan_height: u32,
     pub keys: Option<SilentPaymentKeys>,
     pub spend_key: Option<PublicKey>,
+    pub(crate) spend_secret: Option<SecretKey>,
     pub network: Network,
     pub(crate) utxos: HashMap<OutPoint, Coin>,
+    pub(crate) reserved: HashSet<OutPoint>,
 }
 
 impl Wallet {
@@ -91,8 +93,10 @@ impl Wallet {
             scan_height: 0,
             keys: None,
             spend_key: None,
+            spend_secret: None,
             network,
             utxos: HashMap::new(),
+            reserved: HashSet::new(),
         }
     }
 
@@ -105,8 +109,20 @@ impl Wallet {
             scan_height,
             keys: None,
             spend_key: None,
+            spend_secret: None,
             network,
             utxos,
+            reserved: HashSet::new(),
+        }
+    }
+
+    pub fn reserve_coins(&mut self, outpoints: impl IntoIterator<Item = OutPoint>) {
+        self.reserved.extend(outpoints);
+    }
+
+    pub fn release_coins(&mut self, outpoints: impl IntoIterator<Item = OutPoint>) {
+        for outpoint in outpoints {
+            self.reserved.remove(&outpoint);
         }
     }
 
@@ -119,6 +135,22 @@ impl Wallet {
         let receiver = build_receiver(&scan_key, spend_pub, self.network)?;
         self.spend_key = Some(spend_pub);
         self.keys = Some(SilentPaymentKeys { receiver, scan_key });
+        Ok(())
+    }
+
+    pub fn import_signing_keys(
+        &mut self,
+        scan_key: SecretKey,
+        spend_secret: SecretKey,
+    ) -> Result<(), ::silentpayments::Error> {
+        let secp = Secp256k1::signing_only();
+        let (spend_xonly, parity) = spend_secret.public_key(&secp).x_only_public_key();
+        let normalized = match parity {
+            Parity::Odd => spend_secret.negate(),
+            Parity::Even => spend_secret,
+        };
+        self.import_keys(scan_key, spend_xonly)?;
+        self.spend_secret = Some(normalized);
         Ok(())
     }
 
