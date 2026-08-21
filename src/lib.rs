@@ -11,6 +11,7 @@ pub mod daemonize;
 pub mod ext;
 pub mod ipc;
 pub mod peer;
+pub mod peer_manager;
 
 pub mod logging {
     pub struct Category;
