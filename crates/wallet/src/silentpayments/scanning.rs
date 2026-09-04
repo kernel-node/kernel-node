@@ -2,12 +2,14 @@ use ::silentpayments::{
     receiving::{Label, Receiver},
     utils::receiving::{calculate_ecdh_shared_secret, calculate_tweak_data, get_pubkey_from_input},
 };
-use bitcoin::secp256k1::{self, Scalar, SecretKey, XOnlyPublicKey};
-use bitcoin::{consensus::encode, hashes::Hash};
-use bitcoin::{OutPoint, Script, Transaction};
+use bitcoin::{hashes::Hash, Amount, OutPoint, ScriptBuf, Txid};
+use bitcoin::{
+    secp256k1::{self, Scalar, SecretKey, XOnlyPublicKey},
+    Script,
+};
 use bitcoinkernel::prelude::{
     BlockSpentOutputsExt, CoinExt, ScriptPubkeyExt, TransactionExt, TransactionSpentOutputsExt,
-    TxOutExt,
+    TxInExt, TxOutExt, TxOutPointExt, TxidExt, WitnessStackExt,
 };
 
 use crate::silentpayments::wallet::Coin;
@@ -23,7 +25,7 @@ pub fn scan_transaction(
     receiver: &Receiver,
     b_scan: &SecretKey,
     inputs: &[InputData],
-    tx: &Transaction,
+    taproot_outputs: &[(usize, XOnlyPublicKey)],
 ) -> Vec<(usize, Scalar, Option<Label>)> {
     let mut input_pub_keys = Vec::new();
     let mut outpoints = Vec::new();
@@ -37,26 +39,6 @@ pub fn scan_transaction(
     }
 
     if input_pub_keys.is_empty() {
-        return vec![];
-    }
-
-    // Silent payments always produce taproot outputs — skip transactions without any.
-    let taproot_outputs: Vec<(usize, XOnlyPublicKey)> = tx
-        .output
-        .iter()
-        .enumerate()
-        .filter_map(|(i, out)| {
-            if out.script_pubkey.is_p2tr() {
-                XOnlyPublicKey::from_slice(&out.script_pubkey.as_bytes()[2..])
-                    .ok()
-                    .map(|pk| (i, pk))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if taproot_outputs.is_empty() {
         return vec![];
     }
 
@@ -99,56 +81,70 @@ pub(crate) fn scan_block_inner(
         .skip(1)
         .zip(spent_outputs.iter())
     {
-        let has_p2tr = kernel_tx.outputs().any(|out| {
-            let bytes = out.script_pubkey().to_bytes();
-            Script::from_bytes(&bytes).is_p2tr()
-        });
-        if !has_p2tr {
+        let taproot_outputs: Vec<(usize, XOnlyPublicKey)> = kernel_tx
+            .outputs()
+            .enumerate()
+            .filter_map(|(i, out)| parse_p2tr(out.script_pubkey().as_bytes()).map(|pk| (i, pk)))
+            .collect();
+
+        if taproot_outputs.is_empty() {
             continue;
         }
 
-        let tx_bytes = kernel_tx
-            .consensus_encode()
-            .expect("kernel tx serialization");
-        let btc_tx: Transaction =
-            encode::deserialize(&tx_bytes).expect("kernel tx deserialization");
-
-        let mut inputs = Vec::with_capacity(btc_tx.input.len());
-        for (input_idx, btc_input) in btc_tx.input.iter().enumerate() {
+        let mut inputs: Vec<InputData> = Vec::with_capacity(kernel_tx.input_count());
+        for (idx, input) in kernel_tx.inputs().enumerate() {
             let coin = tx_spent
-                .coin(input_idx)
+                .coin(idx)
                 .expect("input/spent-output count mismatch");
+            let outpoint = input.outpoint();
             let mut buf = [0u8; 36];
-            buf[..32].copy_from_slice(&btc_input.previous_output.txid.to_byte_array());
-            buf[32..].copy_from_slice(&btc_input.previous_output.vout.to_le_bytes());
+            buf[..32].copy_from_slice(&outpoint.txid().to_bytes());
+            buf[32..].copy_from_slice(&outpoint.index().to_le_bytes());
+            let witness: Vec<Vec<u8>> = input.witness_stack().items().collect();
+            let script_sig = input.script_sig().unwrap_or_default();
             inputs.push(InputData {
-                script_sig: btc_input.script_sig.as_bytes().to_vec(),
-                witness: btc_input.witness.iter().map(|item| item.to_vec()).collect(),
+                script_sig,
+                witness,
                 prevout_script: coin.output().script_pubkey().to_bytes(),
                 outpoint: silentpayments::utils::OutPoint::from_bytes(buf),
             });
         }
 
-        let txid = btc_tx.compute_txid();
-        for (output_index, tweak, label) in scan_transaction(receiver, b_scan, &inputs, &btc_tx) {
-            if let Some(out) = btc_tx.output.get(output_index) {
-                let outpoint = OutPoint {
+        let matches = scan_transaction(receiver, b_scan, &inputs, &taproot_outputs);
+        if matches.is_empty() {
+            continue;
+        }
+
+        let txid = Txid::from_byte_array(kernel_tx.txid().to_bytes());
+        for (output_index, tweak, label) in matches {
+            let out = kernel_tx
+                .output(output_index)
+                .expect("index came from this tx");
+            found.push((
+                OutPoint {
                     txid,
                     vout: output_index as u32,
-                };
-                found.push((
-                    outpoint,
-                    Coin {
-                        value: out.value,
-                        script_pubkey: out.script_pubkey.clone(),
-                        tweak,
-                        label: label.map(|l| l.into_inner()),
-                        block_height,
-                        spent_by: None,
-                    },
-                ));
-            }
+                },
+                Coin {
+                    value: Amount::from_sat(out.value() as u64),
+                    script_pubkey: ScriptBuf::from(out.script_pubkey().to_bytes()),
+                    tweak,
+                    label: label.map(|l| l.into_inner()),
+                    block_height,
+                    spent_by: None,
+                },
+            ));
         }
     }
     found
+}
+
+#[inline]
+fn parse_p2tr(script: &[u8]) -> Option<XOnlyPublicKey> {
+    let script = Script::from_bytes(script);
+    if script.is_p2tr() {
+        XOnlyPublicKey::from_slice(&script.as_bytes()[2..]).ok()
+    } else {
+        None
+    }
 }
