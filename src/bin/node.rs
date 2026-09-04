@@ -18,9 +18,8 @@ use bitcoin::p2p::{
 use bitcoin::secp256k1::rand::random;
 use bitcoin::{hashes::Hash, BlockHash, Network, Transaction};
 use bitcoinkernel::{
-    core::BlockHashExt, prelude::BlockValidationStateExt, ChainType, ChainstateManager,
-    ChainstateManagerBuilder, Context, ContextBuilder, Log, Logger, SynchronizationState,
-    ValidationMode,
+    core::BlockHashExt, prelude::BlockValidationStateExt, ChainType, ChainstateManagerBuilder,
+    Context, ContextBuilder, Log, Logger, SynchronizationState, ValidationMode,
 };
 use kernel_node::{
     daemonize::Daemonize,
@@ -63,7 +62,6 @@ fn create_context(
     fatal: FatalShutdown,
     tip_state: &Arc<Mutex<TipState>>,
     wallet: Arc<Mutex<Wallet>>,
-    chainman_holder: Arc<std::sync::OnceLock<Arc<ChainstateManager>>>,
     scan_tx: mpsc::Sender<ScanEvent>,
 ) -> Arc<Context> {
     let tip_state_clone = tip_state.clone();
@@ -73,24 +71,13 @@ fn create_context(
     let fatal_flush = fatal.clone();
     Arc::new(ContextBuilder::new()
         .chain_type(chain_type)
-        .with_block_connected_validation(move |block: bitcoinkernel::Block, entry: bitcoinkernel::BlockTreeEntry<'_>| {
+        .with_block_connected_validation(move |block: bitcoinkernel::Block, _entry: bitcoinkernel::BlockTreeEntry<'_>| {
             if wallet.lock().unwrap().keys.is_none() {
                 return;
             }
-            let Some(chainman) = chainman_holder.get() else { return };
-            match chainman.read_spent_outputs(&entry) {
-                Ok(spent_outputs) => {
-                    if scan_tx.send(ScanEvent::Connected {
-                        block_height: entry.height() as u32,
-                        block,
-                        spent_outputs,
-                    }).is_err() {
-                        fatal_connected.trigger(Category::NODE, "Scan channel closed unexpectedly during block connection");
-                    }
-                }
-                Err(message) => {
-                    fatal_connected.trigger(Category::KERNEL, format!("Fatal error reading block spent outputs: {}", message));
-                }
+            let block_hash = block.hash();
+            if scan_tx.send(ScanEvent::Connected { block, block_hash }).is_err() {
+                fatal_connected.trigger(Category::NODE, "Scan channel closed unexpectedly during block connection");
             }
         })
         .with_block_disconnected_validation(move |block: bitcoinkernel::Block, entry: bitcoinkernel::BlockTreeEntry<'_>| {
@@ -321,6 +308,7 @@ fn run(
     };
 
     let chainman = Arc::clone(&node_state.chainman);
+    let chainman_for_scan = Arc::clone(&node_state.chainman);
     let context = Arc::clone(&node_state.context);
     let addrman = Arc::new(Mutex::new(table));
     let addrman_for_feelers = Arc::clone(&addrman);
@@ -401,11 +389,25 @@ fn run(
         info!(target: Category::NODE, "Starting scan thread.");
         while running_scan.load(Ordering::SeqCst) {
             match scan_rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(ScanEvent::Connected {
-                    block_height,
-                    block,
-                    spent_outputs,
-                }) => {
+                Ok(ScanEvent::Connected { block, block_hash }) => {
+                    let Some(entry) = chainman_for_scan.get_block_tree_entry(&block_hash) else {
+                        fatal_scan.trigger(
+                            Category::KERNEL,
+                            format!("Connected block {block_hash} is missing from the block tree"),
+                        );
+                        continue;
+                    };
+                    let block_height = entry.height() as u32;
+                    let spent_outputs = match chainman_for_scan.read_spent_outputs(&entry) {
+                        Ok(spent_outputs) => spent_outputs,
+                        Err(message) => {
+                            fatal_scan.trigger(
+                                Category::KERNEL,
+                                format!("Fatal error reading block spent outputs: {message}"),
+                            );
+                            continue;
+                        }
+                    };
                     let mut wallet = wallet.lock().unwrap();
                     let count = wallet.scan_block(block, spent_outputs, block_height);
                     if let Err(e) = wallet_store.save(&wallet) {
@@ -558,9 +560,6 @@ fn main() {
     if let Some(path) = config.sp_keys_file.as_ref() {
         auto_import_keys(&mut wallet.lock().unwrap(), path);
     }
-    let chainman_holder: Arc<std::sync::OnceLock<Arc<ChainstateManager>>> =
-        Arc::new(std::sync::OnceLock::new());
-
     let (scan_tx, scan_rx) = mpsc::channel::<ScanEvent>();
 
     let fatal = FatalShutdown::new(shutdown_tx.clone());
@@ -569,7 +568,6 @@ fn main() {
         fatal.clone(),
         &tip_state,
         Arc::clone(&wallet),
-        Arc::clone(&chainman_holder),
         scan_tx,
     );
 
@@ -583,10 +581,6 @@ fn main() {
                 .unwrap(),
         );
     let chainman = Arc::new(chainman_builder.build().unwrap());
-    chainman_holder
-        .set(Arc::clone(&chainman))
-        .ok()
-        .expect("chainman holder already set");
 
     let (block_tx, block_rx) = mpsc::sync_channel(1);
     let (addr_tx, addr_rx) = mpsc::channel();
