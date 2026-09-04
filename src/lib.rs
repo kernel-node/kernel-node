@@ -27,9 +27,8 @@ pub mod logging {
 
 pub enum ScanEvent {
     Connected {
-        block_height: u32,
         block: bitcoinkernel::Block,
-        spent_outputs: bitcoinkernel::BlockSpentOutputs,
+        block_hash: bitcoinkernel::BlockHash,
     },
     Disconnected {
         block: bitcoinkernel::Block,
