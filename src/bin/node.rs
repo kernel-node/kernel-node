@@ -27,7 +27,7 @@ use kernel_node::{
     ext::{ChainExt, DirnameExt, NetworkExt},
     ipc::IpcInterface,
     logging::Category,
-    peer::{NodeState, TipState},
+    peer::{DownloadState, NodeState, TipState},
     peer_manager::PeerManager,
     resolve_seeds,
     server_capnp::server,
@@ -598,6 +598,7 @@ fn main() {
         tip_state,
         chainman,
         context: Arc::clone(&context),
+        download: Mutex::new(DownloadState::default()),
     };
 
     if let Err(err) = node_state.chainman.import_blocks() {
@@ -608,6 +609,7 @@ fn main() {
     let tip_index = node_state.chainman.active_chain().tip();
     let hash = tip_index.block_hash();
     node_state.set_tip_state(BlockHash::from_byte_array(hash.to_bytes()));
+    node_state.seed_download_tip(BlockHash::from_byte_array(hash.to_bytes()));
 
     info!(target: Category::KERNEL, "Bitcoin kernel initialized");
 
