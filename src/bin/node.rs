@@ -57,6 +57,19 @@ const BROADCAST_PONG_TIMEOUT: Duration = Duration::from_secs(5);
 
 configure_me::include_config!();
 
+fn join_connect(peers: &mut String, next: String) {
+    peers.push(',');
+    peers.push_str(&next);
+}
+
+fn parse_connect(connect: Option<&str>) -> Result<Vec<SocketAddr>, &str> {
+    connect
+        .into_iter()
+        .flat_map(|list| list.split(','))
+        .map(|addr| addr.trim().parse().map_err(|_| addr))
+        .collect()
+}
+
 fn create_context(
     chain_type: ChainType,
     fatal: FatalShutdown,
@@ -251,7 +264,7 @@ fn broadcast_transaction(
 #[allow(clippy::too_many_arguments)]
 fn run(
     network: Network,
-    connect: Option<SocketAddr>,
+    connect: &[SocketAddr],
     node_state: NodeState,
     shutdown_rx: mpsc::Receiver<()>,
     addr_rx: mpsc::Receiver<Vec<AddrV2Message>>,
@@ -262,25 +275,27 @@ fn run(
     fatal: FatalShutdown,
 ) -> std::io::Result<()> {
     let mut table = addrman::Table::<TABLE_WIDTH, TABLE_SLOT, MAX_BUCKETS>::new();
-    match connect {
-        Some(connect) => {
-            let record = match connect.ip() {
-                IpAddr::V4(ipv4) => addrman::Record::new(
-                    AddrV2::Ipv4(ipv4),
-                    connect.port(),
-                    ServiceFlags::NETWORK,
-                    &DNS_RESOLVER,
-                ),
-                IpAddr::V6(ipv6) => addrman::Record::new(
-                    AddrV2::Ipv6(ipv6),
-                    connect.port(),
-                    ServiceFlags::NETWORK,
-                    &DNS_RESOLVER,
-                ),
-            };
-            table.add(&record);
+    match connect.is_empty() {
+        false => {
+            for peer in connect {
+                let record = match peer.ip() {
+                    IpAddr::V4(ipv4) => addrman::Record::new(
+                        AddrV2::Ipv4(ipv4),
+                        peer.port(),
+                        ServiceFlags::NETWORK,
+                        &DNS_RESOLVER,
+                    ),
+                    IpAddr::V6(ipv6) => addrman::Record::new(
+                        AddrV2::Ipv6(ipv6),
+                        peer.port(),
+                        ServiceFlags::NETWORK,
+                        &DNS_RESOLVER,
+                    ),
+                };
+                table.add(&record);
+            }
         }
-        None => {
+        true => {
             let addresses = resolve_seeds(network);
             info!(target: Category::NET, "Resolved {} addresses from DNS seeds", addresses.len());
             for addr in &addresses {
@@ -323,8 +338,8 @@ fn run(
         network,
         fatal.clone(),
     );
-    if connect.is_some() {
-        peer_manager = peer_manager.max_peers(1);
+    if !connect.is_empty() {
+        peer_manager = peer_manager.max_peers(connect.len());
     }
     peer_manager.start();
     let peer_writers = peer_manager.peer_writers().to_vec();
@@ -522,6 +537,13 @@ fn main() {
     let ipc_shutdown = shutdown_tx.clone();
 
     let network = config.network.parse::<Network>().expect("invalid network");
+    let connect = match parse_connect(config.connect.as_deref()) {
+        Ok(connect) => connect,
+        Err(addr) => {
+            error!(target: Category::NODE, "--connect value {addr} is not an address in the form ip:port");
+            std::process::exit(1);
+        }
+    };
     let wallet_store = WalletStore::new(
         PathBuf::from(config.datadir.data_dir()).join("wallet.bin"),
         network.wallet_network(),
@@ -592,10 +614,6 @@ fn main() {
 
     info!(target: Category::KERNEL, "Bitcoin kernel initialized");
 
-    let connect = config
-        .connect
-        .map(|sock| sock.parse::<SocketAddr>().unwrap());
-
     if shutdown_rx.try_recv().is_ok() {
         info!(target: Category::NODE, "Shutting down!");
         return;
@@ -655,7 +673,7 @@ fn main() {
 
     run(
         network,
-        connect,
+        &connect,
         node_state,
         shutdown_rx,
         addr_rx,
