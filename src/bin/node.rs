@@ -30,6 +30,7 @@ use kernel_node::{
     peer_manager::PeerManager,
     resolve_seeds,
     server_capnp::server,
+    socks5::Socks5Proxy,
     FatalShutdown, ScanEvent,
 };
 use log::{debug, error, info, warn};
@@ -252,6 +253,7 @@ fn broadcast_transaction(
 fn run(
     network: Network,
     connect: Option<SocketAddr>,
+    proxy: Option<Socks5Proxy>,
     node_state: NodeState,
     shutdown_rx: mpsc::Receiver<()>,
     addr_rx: mpsc::Receiver<Vec<AddrV2Message>>,
@@ -325,6 +327,10 @@ fn run(
     );
     if connect.is_some() {
         peer_manager = peer_manager.max_peers(1);
+    }
+    if let Some(proxy) = proxy {
+        info!(target: Category::NET, "Using Socks5 proxy for outbound connections");
+        peer_manager.set_proxy(proxy);
     }
     peer_manager.start();
     let peer_writers = peer_manager.peer_writers().to_vec();
@@ -526,6 +532,7 @@ fn main() {
         PathBuf::from(config.datadir.data_dir()).join("wallet.bin"),
         network.wallet_network(),
     );
+
     let initial_wallet = if wallet_store.exists() {
         match wallet_store.load() {
             Ok(loaded) => {
@@ -556,6 +563,18 @@ fn main() {
     let (scan_tx, scan_rx) = mpsc::channel::<ScanEvent>();
 
     let fatal = FatalShutdown::new(shutdown_tx.clone());
+
+    let proxy = match config.proxy.as_ref() {
+        Some(s) => match s.parse::<SocketAddr>() {
+            Ok(addr) => Some(Socks5Proxy::from_proxy_socket_addr(addr)),
+            Err(e) => {
+                fatal.trigger(Category::NODE, format!("Invalid --proxy address {s}: {e}"));
+                return;
+            }
+        },
+        None => None,
+    };
+
     let context = create_context(
         network.chain_type(),
         fatal.clone(),
@@ -656,6 +675,7 @@ fn main() {
     run(
         network,
         connect,
+        proxy,
         node_state,
         shutdown_rx,
         addr_rx,

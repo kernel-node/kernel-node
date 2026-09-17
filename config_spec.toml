@@ -27,3 +27,9 @@ name = "sp_keys_file"
 type = "String"
 optional = true
 doc = "Path to a binary silent payments keys file to import at startup."
+
+[[param]]
+name = "proxy"
+type = "String"
+optional = true
+doc = "Socks5 proxy for outbound peer connections (format: ip:port)."
