@@ -12,10 +12,8 @@ use std::{
 
 use bitcoin::p2p::{
     address::{AddrV2, AddrV2Message},
-    message::NetworkMessage,
     ServiceFlags,
 };
-use bitcoin::secp256k1::rand::random;
 use bitcoin::{hashes::Hash, BlockHash, Network, Transaction};
 use bitcoinkernel::{
     prelude::BlockValidationStateExt, ChainType, ChainstateManagerBuilder, Context, ContextBuilder,
@@ -34,10 +32,6 @@ use kernel_node::{
     FatalShutdown, ScanEvent,
 };
 use log::{debug, error, info, warn};
-use p2p::{
-    handshake::ConnectionConfig,
-    net::{ConnectionExt, ConnectionReader, TimeoutParams},
-};
 use std::path::PathBuf;
 use tokio::net::UnixListener;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -51,10 +45,6 @@ const MAX_BUCKETS: usize = 4;
 const DNS_RESOLVER: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
 
 const STALE_BLOCK_DURATION: Duration = Duration::from_secs(60 * 20);
-
-const BROADCAST_TIMEOUT: Duration = Duration::from_secs(60);
-
-const BROADCAST_PONG_TIMEOUT: Duration = Duration::from_secs(5);
 
 configure_me::include_config!();
 
@@ -149,106 +139,6 @@ fn setup_logging() {
     unsafe { GLOBAL_LOG_CALLBACK_HOLDER = Some(Logger::new(KernelLog {}).unwrap()) };
 }
 
-fn open_feeler(table: &mut addrman::Table<TABLE_WIDTH, TABLE_SLOT, MAX_BUCKETS>, network: Network) {
-    if let Some(record) = table.select() {
-        let (addr, port) = record.network_addr();
-        let socket_addr = match addr {
-            AddrV2::Ipv6(ipv6) => SocketAddr::new(IpAddr::V6(ipv6), port),
-            AddrV2::Ipv4(ipv4) => SocketAddr::new(IpAddr::V4(ipv4), port),
-            _ => return,
-        };
-        let conf = ConnectionConfig::new()
-            .change_network(network)
-            .set_service_requirement(ServiceFlags::NETWORK)
-            .offer_services(ServiceFlags::WITNESS)
-            .user_agent("/kernel-node:0.1.0/".into());
-        match conf.open_connection(socket_addr, TimeoutParams::new()) {
-            Ok(_) => {
-                info!(target: Category::NODE, "Successful feeler connection opened to {:?}", socket_addr);
-                table.successful_connection(&record);
-            }
-            Err(_) => {
-                info!(target: Category::NODE, "Failed feeler connection to {:?}", socket_addr);
-                table.failed_connection(&record);
-            }
-        }
-    }
-}
-
-fn wait_for_pong(reader: &mut ConnectionReader, nonce: u64) -> bool {
-    let deadline = Instant::now() + BROADCAST_PONG_TIMEOUT;
-    while Instant::now() < deadline {
-        match reader.read_message() {
-            Ok(Some(NetworkMessage::Pong(received))) if received == nonce => return true,
-            Ok(_) => continue,
-            Err(p2p::net::Error::Io(e))
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                continue
-            }
-            Err(_) => return false,
-        }
-    }
-    false
-}
-
-fn broadcast_transaction(
-    table: &mut addrman::Table<TABLE_WIDTH, TABLE_SLOT, MAX_BUCKETS>,
-    network: Network,
-    tx: &Transaction,
-) -> bool {
-    let txid = tx.compute_txid();
-    let start = Instant::now();
-    loop {
-        if start.elapsed() >= BROADCAST_TIMEOUT {
-            break;
-        }
-        let Some(record) = table.select() else {
-            break;
-        };
-        let (addr, port) = record.network_addr();
-        let socket_addr = match addr {
-            AddrV2::Ipv6(ipv6) => SocketAddr::new(IpAddr::V6(ipv6), port),
-            AddrV2::Ipv4(ipv4) => SocketAddr::new(IpAddr::V4(ipv4), port),
-            _ => continue,
-        };
-        let conf = ConnectionConfig::new()
-            .change_network(network)
-            .offer_services(ServiceFlags::WITNESS)
-            .user_agent("/kernel-node:0.1.0/".into());
-        let mut timeouts = TimeoutParams::new();
-        timeouts.read_timeout(Duration::from_secs(1));
-        match conf.open_connection(socket_addr, timeouts) {
-            Ok((writer, mut reader, _)) => {
-                match writer.send_message(NetworkMessage::Tx(tx.clone())) {
-                    Ok(_) => {
-                        let nonce: u64 = random();
-                        if let Err(e) = writer.send_message(NetworkMessage::Ping(nonce)) {
-                            warn!(target: Category::NODE, "Failed to ping {:?} after sending {}: {}", socket_addr, txid, e);
-                        } else if wait_for_pong(&mut reader, nonce) {
-                            info!(target: Category::NODE, "Broadcast transaction {} to {:?}", txid, socket_addr);
-                            table.successful_connection(&record);
-                            return true;
-                        } else {
-                            warn!(target: Category::NODE, "No pong from {:?} confirming {}", socket_addr, txid);
-                        }
-                    }
-                    Err(e) => {
-                        warn!(target: Category::NODE, "Failed to send transaction to {:?}: {}", socket_addr, e);
-                    }
-                }
-            }
-            Err(_) => {
-                info!(target: Category::NODE, "Failed broadcast connection to {:?}", socket_addr);
-                table.failed_connection(&record);
-            }
-        }
-    }
-    warn!(target: Category::NODE, "Failed to broadcast transaction {}", txid);
-    false
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run(
     network: Network,
@@ -309,7 +199,6 @@ fn run(
     let chainman_for_scan = Arc::clone(&node_state.chainman);
     let context = Arc::clone(&node_state.context);
     let addrman = Arc::new(Mutex::new(table));
-    let addrman_for_feelers = Arc::clone(&addrman);
     let wallet_for_broadcast = Arc::clone(&wallet);
     let node_state = Arc::new(node_state);
 
@@ -317,7 +206,7 @@ fn run(
     let running_addr = running.clone();
     let running_block = running.clone();
     let running_scan = running.clone();
-    let running_feelers = running.clone();
+    let running_broadcast = running.clone();
 
     let mut peer_manager = PeerManager::new(
         Arc::clone(&addrman),
@@ -334,6 +223,7 @@ fn run(
     }
     peer_manager.start();
     let peer_writers = peer_manager.peer_writers().to_vec();
+    let broadcaster = peer_manager.broadcaster();
 
     let addr_processing_handler = thread::spawn(move || {
         info!(target: Category::NODE, "Starting addr processing thread.");
@@ -448,17 +338,12 @@ fn run(
         info!(target: Category::NODE, "Stopping scan thread.");
     });
 
-    let feeler_thread = std::thread::spawn(move || {
-        info!(target: Category::NODE, "Starting feeler thread.");
-        let mut last_feeler = Instant::now();
-        while running_feelers.load(Ordering::SeqCst) {
+    let broadcast_thread = std::thread::spawn(move || {
+        info!(target: Category::NODE, "Starting broadcast thread.");
+        while running_broadcast.load(Ordering::SeqCst) {
             match broadcast_rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(tx) => {
-                    let delivered = {
-                        let mut table = addrman_for_feelers.lock().unwrap();
-                        broadcast_transaction(table.deref_mut(), network, &tx)
-                    };
-                    if !delivered {
+                    if !broadcaster.broadcast_transaction(&tx) {
                         warn!(
                             target: Category::NODE,
                             "Releasing reserved coins after failed broadcast of {}",
@@ -470,16 +355,11 @@ fn run(
                             .release_coins(tx.input.iter().map(|i| i.previous_output));
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    if Instant::now().duration_since(last_feeler) > Duration::from_secs(30) {
-                        let mut table = addrman_for_feelers.lock().unwrap();
-                        open_feeler(table.deref_mut(), network);
-                        last_feeler = Instant::now();
-                    }
-                }
+                Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
+        info!(target: Category::NODE, "Stopping broadcast thread.");
     });
 
     if let Ok(()) = shutdown_rx.recv() {
@@ -492,7 +372,7 @@ fn run(
     addr_processing_handler.join().unwrap();
     block_processing_handler.join().unwrap();
     scan_processing_handler.join().unwrap();
-    feeler_thread.join().unwrap();
+    broadcast_thread.join().unwrap();
     peer_manager.join();
 
     info!(target: Category::NODE, "Exiting.");

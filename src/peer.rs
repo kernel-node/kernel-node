@@ -8,7 +8,7 @@ use std::{
 use bitcoin::{
     hashes::Hash,
     p2p::{
-        address::{AddrV2, AddrV2Message},
+        address::AddrV2Message,
         message::NetworkMessage,
         message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory},
         ServiceFlags,
@@ -21,14 +21,14 @@ use bitcoinkernel::{
 use log::{debug, info, warn};
 use p2p::{
     handshake::{ConnectionConfig, ProtocolVersion},
-    net::{ConnectionExt, ConnectionReader, ConnectionWriter, TimeoutParams, READ_TIMEOUT},
+    net::{ConnectionReader, ConnectionWriter, READ_TIMEOUT},
 };
 
 use crate::{
     ext::{CrateBlockExt, CrateHeaderExt},
     logging::Category,
-    peer_manager::Destination,
-    socks5::{OnionAddress, Socks5Proxy},
+    peer_manager::{self, Destination},
+    socks5::Socks5Proxy,
 };
 
 const PROTOCOL_VERSION: ProtocolVersion = 70015;
@@ -496,33 +496,8 @@ impl BitcoinPeer {
             .set_service_requirement(ServiceFlags::NETWORK)
             .offer_services(ServiceFlags::WITNESS)
             .user_agent("/kernel-node:0.1.0/".into());
-        let port = destination.port;
-        let (writer, reader, _) = match proxy {
-            Some(proxy) => {
-                let conn = match &destination.addr {
-                    AddrV2::Ipv4(ipv4) => proxy.connect(*ipv4, port, READ_TIMEOUT)?,
-                    AddrV2::Ipv6(ipv6) => proxy.connect(*ipv6, port, READ_TIMEOUT)?,
-                    AddrV2::TorV3(tor) => {
-                        proxy.connect(OnionAddress::from_pubkey(*tor), port, READ_TIMEOUT)?
-                    }
-                    _ => {
-                        return Err(p2p::net::Error::Io(std::io::Error::other(
-                            "cannot connect to destination address",
-                        )))
-                    }
-                };
-                conf.handshake(conn, TimeoutParams::new())?
-            }
-            None => match &destination.addr {
-                AddrV2::Ipv4(ipv4) => conf.open_connection((*ipv4, port), TimeoutParams::new())?,
-                AddrV2::Ipv6(ipv6) => conf.open_connection((*ipv6, port), TimeoutParams::new())?,
-                _ => {
-                    return Err(p2p::net::Error::Io(std::io::Error::other(
-                        "cannot connect to destination address",
-                    )))
-                }
-            },
-        };
+        let (writer, reader) =
+            peer_manager::connect(conf, &destination, proxy.as_ref(), READ_TIMEOUT)?;
 
         let locators = build_block_locators(node_state.chainman.best_entry().unwrap());
         debug!(target: Category::NET, "Sending headers message...");
