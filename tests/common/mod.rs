@@ -28,6 +28,32 @@ const TIP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 const CLOSED_PEER: &str = "127.0.0.1:1";
 
+pub fn start_mirror(peer: &Node) -> Node {
+    let exe = corepc_node::exe_path().expect("resolve bitcoind");
+    let mut conf = Conf::default();
+    conf.p2p = P2P::Connect(peer.params.p2p_socket.expect("p2p socket"), true);
+    Node::with_conf(exe, &conf).unwrap()
+}
+
+pub fn wait_for_height(node: &Node, height: u64, timeout: Duration) -> bitcoin::BlockHash {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let at = node.client.get_block_count().expect("block count").0;
+        if at == height {
+            return node.client.best_block_hash().expect("best block hash");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "peer did not reach height {height} within {timeout:?} (at {at})"
+        );
+        std::thread::sleep(TIP_POLL_INTERVAL);
+    }
+}
+
+pub fn peer_addrs(nodes: [&Node; 2]) -> [String; 2] {
+    nodes.map(|node| node.params.p2p_socket.expect("p2p socket").to_string())
+}
+
 pub fn start_bitcoind() -> Node {
     let exe = corepc_node::exe_path()
         .expect("resolve bitcoind: downloaded build, or BITCOIND_EXE, or bitcoind on PATH");
@@ -76,6 +102,10 @@ impl TestNode {
         peer: impl std::fmt::Display,
         keys: Option<SilentPaymentKeysFile>,
     ) -> Self {
+        Self::start_connected_to(&[peer.to_string()], keys)
+    }
+
+    pub fn start_connected_to(peers: &[String], keys: Option<SilentPaymentKeysFile>) -> Self {
         let tempdir = tempfile::tempdir().unwrap();
         let datadir = tempdir.path().canonicalize().unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_node"));
@@ -84,8 +114,7 @@ impl TestNode {
             .arg("regtest")
             .arg("--datadir")
             .arg(&datadir)
-            .arg("--connect")
-            .arg(peer.to_string());
+            .args(peers.iter().flat_map(|peer| ["--connect", peer]));
         // With no keys, the node starts without a wallet.
         if let Some(keys) = keys {
             let keys_path = datadir.join("keys.bin");
