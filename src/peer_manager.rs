@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     ops::DerefMut,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -17,6 +17,7 @@ use p2p::net::ConnectionWriter;
 use crate::{
     logging::Category,
     peer::{BitcoinPeer, NodeState},
+    socks5::OnionAddress,
     FatalShutdown,
 };
 
@@ -42,7 +43,7 @@ pub struct PeerManager {
     running: Arc<AtomicBool>,
     peer_threads: Vec<thread::JoinHandle<()>>,
     peer_writers: Vec<Arc<Mutex<Option<Arc<ConnectionWriter>>>>>,
-    connected_peers: Arc<Mutex<HashSet<SocketAddr>>>,
+    connected_peers: Arc<Mutex<HashSet<Destination>>>,
 }
 
 impl PeerManager {
@@ -119,7 +120,7 @@ impl PeerManager {
 
                     {
                         let mut connected = connected_peers.lock().unwrap();
-                        if !connected.insert(socket_addr) {
+                        if !connected.insert(Destination::from_socket_addr(socket_addr)) {
                             drop(connected);
                             debug!(target: Category::NET, "Peer thread {}: {} already connected", i, socket_addr);
                             thread::sleep(Duration::from_secs(1));
@@ -134,7 +135,10 @@ impl PeerManager {
                         }
                         Err(e) => {
                             error!(target: Category::NET, "Peer thread {}: could not connect to {}: {}", i, socket_addr, e);
-                            connected_peers.lock().unwrap().remove(&socket_addr);
+                            connected_peers
+                                .lock()
+                                .unwrap()
+                                .remove(&Destination::from_socket_addr(socket_addr));
                             thread::sleep(Duration::from_millis(500));
                             continue;
                         }
@@ -158,7 +162,10 @@ impl PeerManager {
                     }
 
                     peer.release_in_flight(&node_state.download);
-                    connected_peers.lock().unwrap().remove(&socket_addr);
+                    connected_peers
+                        .lock()
+                        .unwrap()
+                        .remove(&Destination::from_socket_addr(socket_addr));
                     *writer_slot_thread.lock().unwrap() = None;
                 }
                 info!(target: Category::NET, "Peer thread {} stopped", i);
@@ -179,6 +186,42 @@ impl PeerManager {
     pub fn join(self) {
         for handle in self.peer_threads {
             let _ = handle.join();
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, std::hash::Hash)]
+pub struct Destination {
+    pub addr: AddrV2,
+    pub port: u16,
+}
+
+impl Destination {
+    pub fn new(addr: AddrV2, port: u16) -> Self {
+        Self { addr, port }
+    }
+
+    pub fn from_socket_addr(socket_addr: SocketAddr) -> Self {
+        match socket_addr.ip() {
+            IpAddr::V4(ipv4) => Destination {
+                addr: AddrV2::Ipv4(ipv4),
+                port: socket_addr.port(),
+            },
+            IpAddr::V6(ipv6) => Destination {
+                addr: AddrV2::Ipv6(ipv6),
+                port: socket_addr.port(),
+            },
+        }
+    }
+}
+
+impl core::fmt::Display for Destination {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.addr {
+            AddrV2::Ipv4(ipv4) => write!(f, "{}:{}", ipv4, self.port),
+            AddrV2::Ipv6(ipv6) => write!(f, "{}:{}", ipv6, self.port),
+            AddrV2::TorV3(torv3) => write!(f, "{}:{}", OnionAddress::from_pubkey(torv3), self.port),
+            _ => write!(f, "unreachable address"),
         }
     }
 }
