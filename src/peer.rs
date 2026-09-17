@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
-    net::SocketAddr,
     sync::{mpsc, Arc, Condvar, Mutex},
     time::Duration,
 };
@@ -9,10 +8,10 @@ use std::{
 use bitcoin::{
     hashes::Hash,
     p2p::{
-        address::AddrV2Message,
+        address::{AddrV2, AddrV2Message},
         message::NetworkMessage,
         message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory},
-        Address, ServiceFlags,
+        ServiceFlags,
     },
 };
 use bitcoin::{BlockHash, Network};
@@ -22,12 +21,14 @@ use bitcoinkernel::{
 use log::{debug, info, warn};
 use p2p::{
     handshake::{ConnectionConfig, ProtocolVersion},
-    net::{ConnectionExt, ConnectionReader, ConnectionWriter, TimeoutParams},
+    net::{ConnectionExt, ConnectionReader, ConnectionWriter, TimeoutParams, READ_TIMEOUT},
 };
 
 use crate::{
     ext::{CrateBlockExt, CrateHeaderExt},
     logging::Category,
+    peer_manager::Destination,
+    socks5::{OnionAddress, Socks5Proxy},
 };
 
 const PROTOCOL_VERSION: ProtocolVersion = 70015;
@@ -468,7 +469,7 @@ pub fn process_message(
 }
 
 pub struct BitcoinPeer {
-    addr: Address,
+    dest: Destination,
     writer: Arc<ConnectionWriter>,
     reader: ConnectionReader,
     state_machine: PeerStateMachine,
@@ -476,13 +477,14 @@ pub struct BitcoinPeer {
 
 impl fmt::Display for BitcoinPeer {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:?}", self.addr)
+        write!(f, "{}", self.dest)
     }
 }
 
 impl BitcoinPeer {
     pub fn new(
-        socket_addr: SocketAddr,
+        destination: Destination,
+        proxy: Option<Socks5Proxy>,
         network: Network,
         node_state: &NodeState,
     ) -> Result<Self, p2p::net::Error> {
@@ -494,15 +496,39 @@ impl BitcoinPeer {
             .set_service_requirement(ServiceFlags::NETWORK)
             .offer_services(ServiceFlags::WITNESS)
             .user_agent("/kernel-node:0.1.0/".into());
-        let (writer, reader, _) = conf.open_connection(socket_addr, TimeoutParams::new())?;
+        let port = destination.port;
+        let (writer, reader, _) = match proxy {
+            Some(proxy) => {
+                let conn = match &destination.addr {
+                    AddrV2::Ipv4(ipv4) => proxy.connect(*ipv4, port, READ_TIMEOUT)?,
+                    AddrV2::Ipv6(ipv6) => proxy.connect(*ipv6, port, READ_TIMEOUT)?,
+                    AddrV2::TorV3(tor) => {
+                        proxy.connect(OnionAddress::from_pubkey(*tor), port, READ_TIMEOUT)?
+                    }
+                    _ => {
+                        return Err(p2p::net::Error::Io(std::io::Error::other(
+                            "cannot connect to destination address",
+                        )))
+                    }
+                };
+                conf.handshake(conn, TimeoutParams::new())?
+            }
+            None => match &destination.addr {
+                AddrV2::Ipv4(ipv4) => conf.open_connection((*ipv4, port), TimeoutParams::new())?,
+                AddrV2::Ipv6(ipv6) => conf.open_connection((*ipv6, port), TimeoutParams::new())?,
+                _ => {
+                    return Err(p2p::net::Error::Io(std::io::Error::other(
+                        "cannot connect to destination address",
+                    )))
+                }
+            },
+        };
 
-        let addr = Address::new(&socket_addr, ServiceFlags::WITNESS);
-        info!(target: Category::NET, "Connected to {:?}", addr);
         let locators = build_block_locators(node_state.chainman.best_entry().unwrap());
         debug!(target: Category::NET, "Sending headers message...");
         writer.send_message(create_getheaders_message(locators))?;
         let peer = BitcoinPeer {
-            addr,
+            dest: destination,
             writer: Arc::new(writer),
             reader,
             state_machine: PeerStateMachine::AwaitingHeaders,

@@ -17,7 +17,7 @@ use p2p::net::ConnectionWriter;
 use crate::{
     logging::Category,
     peer::{BitcoinPeer, NodeState},
-    socks5::OnionAddress,
+    socks5::{OnionAddress, Socks5Proxy},
     FatalShutdown,
 };
 
@@ -44,6 +44,7 @@ pub struct PeerManager {
     peer_threads: Vec<thread::JoinHandle<()>>,
     peer_writers: Vec<Arc<Mutex<Option<Arc<ConnectionWriter>>>>>,
     connected_peers: Arc<Mutex<HashSet<Destination>>>,
+    proxy: Option<Socks5Proxy>,
 }
 
 impl PeerManager {
@@ -63,7 +64,12 @@ impl PeerManager {
             peer_threads: Vec::new(),
             peer_writers: Vec::new(),
             connected_peers: Arc::new(Mutex::new(HashSet::new())),
+            proxy: None,
         }
+    }
+
+    pub fn set_proxy(&mut self, proxy: Socks5Proxy) {
+        self.proxy = Some(proxy);
     }
 
     pub fn max_peers(mut self, n: usize) -> Self {
@@ -87,6 +93,7 @@ impl PeerManager {
             self.peer_writers.push(writer_slot);
             let connected_peers = Arc::clone(&self.connected_peers);
             let fatal = self.fatal.clone();
+            let proxy = self.proxy.clone();
 
             let handle = thread::spawn(move || {
                 info!(target: Category::NET, "Peer thread {} started", i);
@@ -96,9 +103,16 @@ impl PeerManager {
                         let table = addrman.lock().unwrap();
                         table.select().map(|record| record.network_addr())
                     };
-                    let socket_addr = match selected {
-                        Some((AddrV2::Ipv4(ipv4), port)) => SocketAddr::from((ipv4, port)),
-                        Some((AddrV2::Ipv6(ipv6), port)) => SocketAddr::from((ipv6, port)),
+                    let destination = match selected {
+                        Some((AddrV2::Ipv4(ipv4), port)) => {
+                            Destination::from_socket_addr(SocketAddr::from((ipv4, port)))
+                        }
+                        Some((AddrV2::Ipv6(ipv6), port)) => {
+                            Destination::from_socket_addr(SocketAddr::from((ipv6, port)))
+                        }
+                        Some((AddrV2::TorV3(pubkey), port)) if proxy.is_some() => {
+                            Destination::new(AddrV2::TorV3(pubkey), port)
+                        }
                         Some(_) => continue,
                         None => {
                             empty_selections += 1;
@@ -120,25 +134,27 @@ impl PeerManager {
 
                     {
                         let mut connected = connected_peers.lock().unwrap();
-                        if !connected.insert(Destination::from_socket_addr(socket_addr)) {
+                        if !connected.insert(destination.clone()) {
                             drop(connected);
-                            debug!(target: Category::NET, "Peer thread {}: {} already connected", i, socket_addr);
+                            debug!(target: Category::NET, "Peer thread {}: {} already connected", i, destination);
                             thread::sleep(Duration::from_secs(1));
                             continue;
                         }
                     }
 
-                    let mut peer = match BitcoinPeer::new(socket_addr, network, &node_state) {
+                    let mut peer = match BitcoinPeer::new(
+                        destination.clone(),
+                        proxy.clone(),
+                        network,
+                        &node_state,
+                    ) {
                         Ok(peer) => {
                             *writer_slot_thread.lock().unwrap() = Some(peer.writer());
                             peer
                         }
                         Err(e) => {
-                            error!(target: Category::NET, "Peer thread {}: could not connect to {}: {}", i, socket_addr, e);
-                            connected_peers
-                                .lock()
-                                .unwrap()
-                                .remove(&Destination::from_socket_addr(socket_addr));
+                            error!(target: Category::NET, "Peer thread {}: could not connect to {}: {}", i, destination, e);
+                            connected_peers.lock().unwrap().remove(&destination);
                             thread::sleep(Duration::from_millis(500));
                             continue;
                         }
@@ -162,10 +178,7 @@ impl PeerManager {
                     }
 
                     peer.release_in_flight(&node_state.download);
-                    connected_peers
-                        .lock()
-                        .unwrap()
-                        .remove(&Destination::from_socket_addr(socket_addr));
+                    connected_peers.lock().unwrap().remove(&destination);
                     *writer_slot_thread.lock().unwrap() = None;
                 }
                 info!(target: Category::NET, "Peer thread {} stopped", i);
