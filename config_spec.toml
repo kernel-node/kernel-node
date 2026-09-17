@@ -14,7 +14,8 @@ doc = "Data directory for blockchain and configuration."
 name = "connect"
 type = "String"
 optional = true
-doc = "Connect only to this node (format: ip:port or hostname:port)"
+merge_fn = "crate::join_connect"
+doc = "Connect only to the specified node (format: ip:port). May be given more than once."
 
 [[param]]
 name = "daemon"

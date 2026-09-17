@@ -4,7 +4,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, RecvTimeoutError},
-        Arc, Mutex, Once,
+        Arc, Condvar, Mutex, Once,
     },
     thread::{self, available_parallelism},
     time::{Duration, Instant},
@@ -26,7 +26,7 @@ use kernel_node::{
     ext::{ChainExt, DirnameExt, NetworkExt},
     ipc::IpcInterface,
     logging::Category,
-    peer::NodeState,
+    peer::{DownloadState, NodeState},
     peer_manager::PeerManager,
     resolve_seeds,
     server_capnp::server,
@@ -56,6 +56,19 @@ const BROADCAST_TIMEOUT: Duration = Duration::from_secs(60);
 const BROADCAST_PONG_TIMEOUT: Duration = Duration::from_secs(5);
 
 configure_me::include_config!();
+
+fn join_connect(peers: &mut String, next: String) {
+    peers.push(',');
+    peers.push_str(&next);
+}
+
+fn parse_connect(connect: Option<&str>) -> Result<Vec<SocketAddr>, &str> {
+    connect
+        .into_iter()
+        .flat_map(|list| list.split(','))
+        .map(|addr| addr.trim().parse().map_err(|_| addr))
+        .collect()
+}
 
 fn create_context(
     chain_type: ChainType,
@@ -251,11 +264,10 @@ fn broadcast_transaction(
 #[allow(clippy::too_many_arguments)]
 fn run(
     network: Network,
-    connect: Option<SocketAddr>,
+    connect: &[SocketAddr],
     node_state: NodeState,
     shutdown_rx: mpsc::Receiver<()>,
     addr_rx: mpsc::Receiver<Vec<AddrV2Message>>,
-    block_rx: mpsc::Receiver<bitcoinkernel::Block>,
     scan_rx: mpsc::Receiver<ScanEvent>,
     broadcast_rx: mpsc::Receiver<Transaction>,
     wallet: Arc<Mutex<Wallet>>,
@@ -263,25 +275,27 @@ fn run(
     fatal: FatalShutdown,
 ) -> std::io::Result<()> {
     let mut table = addrman::Table::<TABLE_WIDTH, TABLE_SLOT, MAX_BUCKETS>::new();
-    match connect {
-        Some(connect) => {
-            let record = match connect.ip() {
-                IpAddr::V4(ipv4) => addrman::Record::new(
-                    AddrV2::Ipv4(ipv4),
-                    connect.port(),
-                    ServiceFlags::NETWORK,
-                    &DNS_RESOLVER,
-                ),
-                IpAddr::V6(ipv6) => addrman::Record::new(
-                    AddrV2::Ipv6(ipv6),
-                    connect.port(),
-                    ServiceFlags::NETWORK,
-                    &DNS_RESOLVER,
-                ),
-            };
-            table.add(&record);
+    match connect.is_empty() {
+        false => {
+            for peer in connect {
+                let record = match peer.ip() {
+                    IpAddr::V4(ipv4) => addrman::Record::new(
+                        AddrV2::Ipv4(ipv4),
+                        peer.port(),
+                        ServiceFlags::NETWORK,
+                        &DNS_RESOLVER,
+                    ),
+                    IpAddr::V6(ipv6) => addrman::Record::new(
+                        AddrV2::Ipv6(ipv6),
+                        peer.port(),
+                        ServiceFlags::NETWORK,
+                        &DNS_RESOLVER,
+                    ),
+                };
+                table.add(&record);
+            }
         }
-        None => {
+        true => {
             let addresses = resolve_seeds(network);
             info!(target: Category::NET, "Resolved {} addresses from DNS seeds", addresses.len());
             for addr in &addresses {
@@ -324,8 +338,8 @@ fn run(
         network,
         fatal.clone(),
     );
-    if connect.is_some() {
-        peer_manager = peer_manager.max_peers(1);
+    if !connect.is_empty() {
+        peer_manager = peer_manager.max_peers(connect.len());
     }
     peer_manager.start();
     let peer_writers = peer_manager.peer_writers().to_vec();
@@ -353,17 +367,18 @@ fn run(
         info!(target: Category::NODE, "Stopping addr processing thread.");
     });
 
+    let node_state_block = Arc::clone(&node_state);
     let block_processing_handler = thread::spawn(move || {
         info!(target: Category::NODE, "Starting block processing thread.");
         let mut last_block = Instant::now();
         while running_block.load(Ordering::SeqCst) {
-            match block_rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(block) => {
+            match node_state_block.wait_for_connectable(Duration::from_secs(1)) {
+                Some(block) => {
                     debug!(target: Category::KERNEL, "Validating block.");
                     last_block = Instant::now();
                     let _ = chainman.process_block(&block);
                 }
-                Err(RecvTimeoutError::Timeout) => {
+                None => {
                     if last_block.elapsed() > STALE_BLOCK_DURATION {
                         last_block = Instant::now();
                         info!(target: Category::NET, "Potential stale block. Dropping peers to find new ones.");
@@ -373,9 +388,7 @@ fn run(
                             }
                         }
                     }
-                    continue;
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
         info!(target: Category::NODE, "Stopping block processing thread.");
@@ -524,6 +537,13 @@ fn main() {
     let ipc_shutdown = shutdown_tx.clone();
 
     let network = config.network.parse::<Network>().expect("invalid network");
+    let connect = match parse_connect(config.connect.as_deref()) {
+        Ok(connect) => connect,
+        Err(addr) => {
+            error!(target: Category::NODE, "--connect value {addr} is not an address in the form ip:port");
+            std::process::exit(1);
+        }
+    };
     let wallet_store = WalletStore::new(
         PathBuf::from(config.datadir.data_dir()).join("wallet.bin"),
         network.wallet_network(),
@@ -576,15 +596,15 @@ fn main() {
         );
     let chainman = Arc::new(chainman_builder.build().unwrap());
 
-    let (block_tx, block_rx) = mpsc::sync_channel(1);
     let (addr_tx, addr_rx) = mpsc::channel();
     let (broadcast_tx, broadcast_rx) = mpsc::sync_channel::<Transaction>(1);
 
     let node_state = NodeState {
         addr_tx,
-        block_tx,
         chainman,
         context: Arc::clone(&context),
+        download: Mutex::new(DownloadState::default()),
+        connectable: Condvar::new(),
     };
 
     if let Err(err) = node_state.chainman.import_blocks() {
@@ -593,10 +613,6 @@ fn main() {
     }
 
     info!(target: Category::KERNEL, "Bitcoin kernel initialized");
-
-    let connect = config
-        .connect
-        .map(|sock| sock.parse::<SocketAddr>().unwrap());
 
     if shutdown_rx.try_recv().is_ok() {
         info!(target: Category::NODE, "Shutting down!");
@@ -657,11 +673,10 @@ fn main() {
 
     run(
         network,
-        connect,
+        &connect,
         node_state,
         shutdown_rx,
         addr_rx,
-        block_rx,
         scan_rx,
         broadcast_rx,
         wallet,
