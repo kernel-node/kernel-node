@@ -1,8 +1,9 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     net::SocketAddr,
-    sync::{mpsc, Arc},
+    sync::{mpsc, Arc, Condvar, Mutex},
+    time::Duration,
 };
 
 use bitcoin::{
@@ -31,12 +32,95 @@ use crate::{
 
 const PROTOCOL_VERSION: ProtocolVersion = 70015;
 const MAX_LOCATOR_HASHES: usize = 101;
+const DOWNLOAD_BATCH_SIZE: usize = 16;
+
+#[derive(Default)]
+pub struct DownloadState {
+    queue: VecDeque<BlockHash>,
+    in_flight: HashSet<BlockHash>,
+    buffer: HashMap<BlockHash /* prev */, bitcoinkernel::Block>,
+}
+
+impl DownloadState {
+    fn pop_batch(&mut self, batch_size: usize) -> Vec<BlockHash> {
+        let mut batch = Vec::with_capacity(batch_size);
+        while batch.len() < batch_size {
+            let Some(hash) = self.queue.pop_front() else {
+                break;
+            };
+            if self.in_flight.insert(hash) {
+                batch.push(hash);
+            }
+        }
+        batch
+    }
+
+    fn claim(&mut self, hashes: Vec<BlockHash>) -> Vec<BlockHash> {
+        hashes
+            .into_iter()
+            .filter(|hash| self.in_flight.insert(*hash))
+            .collect()
+    }
+
+    fn release(&mut self, hash: &BlockHash) -> bool {
+        self.in_flight.remove(hash)
+    }
+
+    fn requeue_unreceived(&mut self, inventory: &HashSet<BlockHash>) {
+        if inventory.is_empty() {
+            return;
+        }
+        for hash in inventory {
+            self.in_flight.remove(hash);
+            self.queue.push_front(*hash);
+        }
+        debug!(target: Category::NET, "Re-enqueued {} unreceived blocks", inventory.len());
+    }
+
+    fn buffer_block(&mut self, prev_blockhash: BlockHash, block: bitcoinkernel::Block) {
+        self.buffer.insert(prev_blockhash, block);
+    }
+
+    /// `is_connected` is a parameter so the buffer can be tested without a
+    /// chainstate. What remains once the peers go idle is a competing branch,
+    /// whose parents stay off the active chain until the kernel has enough of
+    /// the branch to adopt it.
+    fn take_connectable(
+        &mut self,
+        is_connected: impl Fn(&BlockHash) -> bool,
+    ) -> Option<bitcoinkernel::Block> {
+        if let Some(prev) = self.buffer.keys().copied().find(&is_connected) {
+            return self.buffer.remove(&prev);
+        }
+        if !self.queue.is_empty() || !self.in_flight.is_empty() {
+            return None;
+        }
+        let prev = self.buffer_head()?;
+        self.buffer.remove(&prev)
+    }
+
+    fn buffered_hashes(&self) -> HashSet<BlockHash> {
+        self.buffer
+            .values()
+            .map(|block| BlockHash::from_byte_array(block.hash().into()))
+            .collect()
+    }
+
+    fn buffer_head(&self) -> Option<BlockHash> {
+        let buffered = self.buffered_hashes();
+        self.buffer
+            .keys()
+            .copied()
+            .find(|prev| !buffered.contains(prev))
+    }
+}
 
 pub struct NodeState {
     pub addr_tx: mpsc::Sender<Vec<AddrV2Message>>,
-    pub block_tx: mpsc::SyncSender<bitcoinkernel::Block>,
     pub context: Arc<Context>,
     pub chainman: Arc<ChainstateManager>,
+    pub download: Mutex<DownloadState>,
+    pub connectable: Condvar,
 }
 
 impl NodeState {
@@ -47,26 +131,56 @@ impl NodeState {
             None => false,
         }
     }
+
+    pub fn buffer_block(&self, prev_blockhash: bitcoin::BlockHash, block: bitcoinkernel::Block) {
+        self.download
+            .lock()
+            .unwrap()
+            .buffer_block(prev_blockhash, block);
+        self.connectable.notify_one();
+    }
+
+    /// Times out so the caller can re-check its shutdown flag.
+    pub fn wait_for_connectable(&self, timeout: Duration) -> Option<bitcoinkernel::Block> {
+        let mut state = self.download.lock().unwrap();
+        if let Some(block) = self.take_connectable(&mut state) {
+            return Some(block);
+        }
+        let (mut state, _) = self.connectable.wait_timeout(state, timeout).unwrap();
+        self.take_connectable(&mut state)
+    }
+
+    fn take_connectable(&self, state: &mut DownloadState) -> Option<bitcoinkernel::Block> {
+        state.take_connectable(|prev| self.is_on_active_chain(prev))
+    }
 }
 
 /// State Machine for setting up a connection and getting blocks from a peer
 ///
 /// ```text
-///       [*]
-///        │
-/// AwaitingHeaders ◄──┐
-///        │           │
-///        ▼           │ unconnecting headers
-///   AwaitingInv ─────┘
-///       ▲ |
-/// Block | | Inv / Headers
-///       | ▼
-///   AwaitingBlock
-///       │ ▲
-///       │ │
-///       └─┘
-///      Block
+///                       [*]
+///                        │
+///                        ▼
+///              ┌─────────────────┐   got 2000 headers:
+///         ┌───▶│ AwaitingHeaders │──┐  ask for the next batch
+///         │    └─────────────────┘◀─┘
+///         │                 │
+///         │                 │ header sync done: build the queue,
+///         │                 │ then take the first batch
+///         │                 ▼
+///         │    ┌─────────────────┐   block arrives (batch not done), or
+///         │    │  AwaitingBlock  │──┐  batch done + queue has more:
+///         │    └─────────────────┘◀─┘  take the next batch
+///         │       ▲         │
+///         │  inv/ │         │ batch done AND queue empty
+///         │  hdrs │         ▼
+///         │    ┌─────────────────┐   nothing to claim: ask again
+///         └────│   AwaitingInv   │──┐
+///              └─────────────────┘◀─┘
 /// ```
+///
+/// The left edge (AwaitingInv ─▶ AwaitingHeaders) is the unconnecting-headers
+/// path: a peer's announced headers don't connect, so we resync headers.
 #[derive(Default)]
 pub enum PeerStateMachine {
     #[default]
@@ -77,7 +191,6 @@ pub enum PeerStateMachine {
 
 pub struct AwaitingBlock {
     pub peer_inventory: HashSet<bitcoin::BlockHash>,
-    pub block_buffer: HashMap<bitcoin::BlockHash /*prev */, bitcoinkernel::Block>,
 }
 
 fn build_block_locators(tip: BlockTreeEntry<'_>) -> Vec<BlockHash> {
@@ -101,6 +214,57 @@ fn build_block_locators(tip: BlockTreeEntry<'_>) -> Vec<BlockHash> {
         }
     }
     locators
+}
+
+fn populate_download_queue(chainman: &ChainstateManager, download: &Mutex<DownloadState>) {
+    if !download.lock().unwrap().queue.is_empty() {
+        return;
+    }
+    let active = chainman.active_chain();
+    let best = match chainman.best_entry() {
+        Some(entry) => entry,
+        None => return,
+    };
+    let best_height = best.height();
+    let mut hashes = Vec::new();
+    let mut current = best;
+    let fork_point = loop {
+        if active.contains(&current) {
+            break BlockHash::from_byte_array(current.block_hash().to_bytes());
+        }
+        hashes.push(BlockHash::from_byte_array(current.block_hash().to_bytes()));
+        match current.prev() {
+            Some(prev) => current = prev,
+            None => return,
+        }
+    };
+    if hashes.is_empty() {
+        return;
+    }
+    let fork_height = best_height - hashes.len() as i32;
+    hashes.reverse();
+    let mut state = download.lock().unwrap();
+    if !state.queue.is_empty() {
+        return;
+    }
+    // Re-queueing held blocks would never let the peers go idle.
+    let buffered = state.buffered_hashes();
+    let queued: VecDeque<BlockHash> = hashes
+        .into_iter()
+        .filter(|hash| !buffered.contains(hash) && !state.in_flight.contains(hash))
+        .collect();
+    if queued.is_empty() {
+        return;
+    }
+    info!(
+        target: Category::NET,
+        "Built download queue with {} blocks (heights {} to {}) forking at {}",
+        queued.len(),
+        fork_height + 1,
+        best_height,
+        fork_point
+    );
+    state.queue = queued;
 }
 
 fn create_getheaders_message(locator_hashes: Vec<bitcoin::BlockHash>) -> NetworkMessage {
@@ -165,6 +329,20 @@ pub fn process_message(
                 }
 
                 if msg_len != 2000 {
+                    populate_download_queue(&node_state.chainman, &node_state.download);
+                    let batch = node_state
+                        .download
+                        .lock()
+                        .unwrap()
+                        .pop_batch(DOWNLOAD_BATCH_SIZE);
+                    if !batch.is_empty() {
+                        return (
+                            PeerStateMachine::AwaitingBlock(AwaitingBlock {
+                                peer_inventory: batch.iter().cloned().collect(),
+                            }),
+                            vec![create_getdata_message(&batch)],
+                        );
+                    }
                     let locators = build_block_locators(node_state.chainman.active_chain().tip());
                     return (
                         PeerStateMachine::AwaitingInv,
@@ -207,13 +385,16 @@ pub fn process_message(
                     );
                 }
 
-                debug!(target: Category::NET, "Requesting {} announced blocks", announced.len());
+                let claimed = node_state.download.lock().unwrap().claim(announced);
+                if claimed.is_empty() {
+                    return (PeerStateMachine::AwaitingInv, vec![]);
+                }
+                debug!(target: Category::NET, "Requesting {} announced blocks", claimed.len());
                 (
                     PeerStateMachine::AwaitingBlock(AwaitingBlock {
-                        peer_inventory: announced.iter().copied().collect(),
-                        block_buffer: HashMap::new(),
+                        peer_inventory: claimed.iter().copied().collect(),
                     }),
-                    vec![create_getdata_message(&announced)],
+                    vec![create_getdata_message(&claimed)],
                 )
             }
             NetworkMessage::Inv(inventory) => {
@@ -227,13 +408,12 @@ pub fn process_message(
                     .collect();
 
                 if !block_hashes.is_empty() {
-                    debug!(target: Category::NET, "Requesting {} blocks", block_hashes.len());
+                    // The queue walks block tree entries, which need these
+                    // headers first.
+                    let locators = build_block_locators(node_state.chainman.best_entry().unwrap());
                     (
-                        PeerStateMachine::AwaitingBlock(AwaitingBlock {
-                            peer_inventory: block_hashes.iter().cloned().collect(),
-                            block_buffer: HashMap::new(),
-                        }),
-                        vec![create_getdata_message(&block_hashes)],
+                        PeerStateMachine::AwaitingHeaders,
+                        vec![create_getheaders_message(locators)],
                     )
                 } else {
                     (PeerStateMachine::AwaitingInv, vec![])
@@ -246,45 +426,35 @@ pub fn process_message(
         },
         PeerStateMachine::AwaitingBlock(mut block_state) => match event {
             NetworkMessage::Block(block) => {
+                let block_hash = block.block_hash();
                 let prev_blockhash = block.header.prev_blockhash;
-                block_state.peer_inventory.remove(&block.block_hash());
-                block_state
-                    .block_buffer
-                    .insert(prev_blockhash, block.convert());
-
-                while let Some(prev) = block_state
-                    .block_buffer
-                    .keys()
-                    .copied()
-                    .find(|prev| node_state.is_on_active_chain(prev))
-                {
-                    let next_block = block_state
-                        .block_buffer
-                        .remove(&prev)
-                        .expect("hash came from the buffer");
-                    if let Err(err) = node_state.block_tx.send(next_block) {
-                        debug!(target: Category::NODE, "Encountered error on block send: {}", err);
-                        return (PeerStateMachine::AwaitingBlock(block_state), vec![]);
-                    }
+                block_state.peer_inventory.remove(&block_hash);
+                // Another peer may have delivered it already.
+                if node_state.download.lock().unwrap().release(&block_hash) {
+                    node_state.buffer_block(prev_blockhash, block.convert());
                 }
 
-                // All expected blocks have arrived. Flush anything left in the
-                // buffer to the kernel and request the next batch. The leftovers
-                // are a competing branch from a reorg.
                 if block_state.peer_inventory.is_empty() {
-                    let leftovers: Vec<_> =
-                        block_state.block_buffer.drain().map(|(_, b)| b).collect();
-                    for leftover in leftovers {
-                        if let Err(err) = node_state.block_tx.send(leftover) {
-                            debug!(target: Category::NODE, "Encountered error on block send: {}", err);
-                            return (PeerStateMachine::AwaitingBlock(block_state), vec![]);
-                        }
+                    let batch = node_state
+                        .download
+                        .lock()
+                        .unwrap()
+                        .pop_batch(DOWNLOAD_BATCH_SIZE);
+                    if !batch.is_empty() {
+                        (
+                            PeerStateMachine::AwaitingBlock(AwaitingBlock {
+                                peer_inventory: batch.iter().cloned().collect(),
+                            }),
+                            vec![create_getdata_message(&batch)],
+                        )
+                    } else {
+                        let locators =
+                            build_block_locators(node_state.chainman.active_chain().tip());
+                        (
+                            PeerStateMachine::AwaitingInv,
+                            vec![create_getblocks_message(locators)],
+                        )
                     }
-                    let locators = build_block_locators(node_state.chainman.active_chain().tip());
-                    (
-                        PeerStateMachine::AwaitingInv,
-                        vec![create_getblocks_message(locators)],
-                    )
                 } else {
                     (PeerStateMachine::AwaitingBlock(block_state), vec![])
                 }
@@ -344,6 +514,15 @@ impl BitcoinPeer {
         Arc::clone(&self.writer)
     }
 
+    pub fn release_in_flight(&self, download: &Mutex<DownloadState>) {
+        if let PeerStateMachine::AwaitingBlock(state) = &self.state_machine {
+            download
+                .lock()
+                .unwrap()
+                .requeue_unreceived(&state.peer_inventory);
+        }
+    }
+
     fn receive_message(&mut self) -> Result<NetworkMessage, p2p::net::Error> {
         Ok(self
             .reader
@@ -363,5 +542,241 @@ impl BitcoinPeer {
             self.writer.send_message(message)?
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash(n: u8) -> BlockHash {
+        BlockHash::from_byte_array([n; 32])
+    }
+
+    fn download(queue: &[BlockHash], in_flight: &[BlockHash]) -> DownloadState {
+        DownloadState {
+            queue: queue.iter().copied().collect(),
+            in_flight: in_flight.iter().copied().collect(),
+            ..Default::default()
+        }
+    }
+
+    fn block_chain(len: usize) -> Vec<bitcoin::Block> {
+        let mut blocks = Vec::with_capacity(len);
+        let mut prev = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+        for i in 0..len {
+            let mut block = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+            block.header.prev_blockhash = prev;
+            block.header.nonce = i as u32;
+            prev = block.block_hash();
+            blocks.push(block);
+        }
+        blocks
+    }
+
+    #[test]
+    fn pop_batch_returns_requested_count() {
+        let mut d = download(&[hash(1), hash(2), hash(3), hash(4)], &[]);
+        assert_eq!(d.pop_batch(2), vec![hash(1), hash(2)]);
+        assert_eq!(d.queue.len(), 2);
+    }
+
+    #[test]
+    fn release_reports_in_flight_membership() {
+        let mut d = download(&[hash(1)], &[]);
+        assert!(!d.release(&hash(1)));
+        d.pop_batch(1);
+        assert!(d.release(&hash(1)));
+        assert!(!d.release(&hash(1)));
+        assert!(!d.release(&hash(2)));
+    }
+
+    #[test]
+    fn pop_batch_marks_in_flight() {
+        let mut d = download(&[hash(1), hash(2)], &[]);
+        d.pop_batch(2);
+        assert!(d.in_flight.contains(&hash(1)));
+        assert!(d.in_flight.contains(&hash(2)));
+    }
+
+    #[test]
+    fn pop_batch_skips_already_in_flight() {
+        let mut d = download(&[hash(1), hash(2), hash(3)], &[hash(2)]);
+        assert_eq!(d.pop_batch(3), vec![hash(1), hash(3)]);
+    }
+
+    #[test]
+    fn pop_batch_returns_partial_when_queue_short() {
+        let mut d = download(&[hash(1)], &[]);
+        assert_eq!(d.pop_batch(16), vec![hash(1)]);
+        assert!(d.queue.is_empty());
+    }
+
+    #[test]
+    fn pop_batch_returns_empty_when_queue_empty() {
+        let mut d = download(&[], &[]);
+        assert!(d.pop_batch(16).is_empty());
+    }
+
+    #[test]
+    fn pop_batch_returns_empty_when_all_in_flight() {
+        let mut d = download(&[hash(1), hash(2)], &[hash(1), hash(2)]);
+        assert!(d.pop_batch(16).is_empty());
+        assert!(d.queue.is_empty());
+    }
+
+    #[test]
+    fn pop_batch_multiple_calls_drain_queue() {
+        let mut d = download(&[hash(1), hash(2), hash(3), hash(4)], &[]);
+        assert_eq!(d.pop_batch(2), vec![hash(1), hash(2)]);
+        assert_eq!(d.pop_batch(2), vec![hash(3), hash(4)]);
+        assert!(d.pop_batch(2).is_empty());
+    }
+
+    #[test]
+    fn pop_batch_zero_batch_size() {
+        let mut d = download(&[hash(1), hash(2)], &[]);
+        assert!(d.pop_batch(0).is_empty());
+        assert_eq!(d.queue.len(), 2);
+    }
+
+    #[test]
+    fn pop_batch_preserves_fifo_order() {
+        let mut d = download(&[hash(1), hash(2), hash(3), hash(4), hash(5)], &[]);
+        assert_eq!(
+            d.pop_batch(5),
+            vec![hash(1), hash(2), hash(3), hash(4), hash(5)]
+        );
+    }
+
+    #[test]
+    fn requeue_unreceived_restores_queue_and_clears_in_flight() {
+        let mut d = download(&[hash(5), hash(6)], &[hash(1), hash(2), hash(3)]);
+        d.requeue_unreceived(&HashSet::from([hash(1), hash(2)]));
+        assert_eq!(d.queue.len(), 4);
+        assert!(d.queue.contains(&hash(1)));
+        assert!(d.queue.contains(&hash(2)));
+        assert!(!d.in_flight.contains(&hash(1)));
+        assert!(!d.in_flight.contains(&hash(2)));
+        assert!(d.in_flight.contains(&hash(3)));
+    }
+
+    #[test]
+    fn requeue_unreceived_blocks_can_be_repopped() {
+        let mut d = download(&[hash(5)], &[hash(1)]);
+        d.requeue_unreceived(&HashSet::from([hash(1)]));
+        assert_eq!(d.pop_batch(16), vec![hash(1), hash(5)]);
+    }
+
+    #[test]
+    fn requeue_unreceived_noop_on_empty() {
+        let mut d = download(&[hash(1)], &[hash(2)]);
+        d.requeue_unreceived(&HashSet::new());
+        assert_eq!(d.queue.len(), 1);
+        assert!(d.in_flight.contains(&hash(2)));
+    }
+
+    #[derive(Default)]
+    struct Connected(HashSet<BlockHash>);
+
+    impl Connected {
+        fn connect(&mut self, hash: BlockHash) {
+            self.0.insert(hash);
+        }
+
+        fn contains(&self) -> impl Fn(&BlockHash) -> bool + '_ {
+            move |hash| self.0.contains(hash)
+        }
+    }
+
+    fn drain(d: &mut DownloadState, connected: &mut Connected) -> Vec<BlockHash> {
+        let mut order = Vec::new();
+        while let Some(block) = d.take_connectable(connected.contains()) {
+            let hash = BlockHash::from_byte_array(block.hash().into());
+            connected.connect(hash);
+            order.push(hash);
+        }
+        order
+    }
+
+    #[test]
+    fn buffer_drains_in_chain_order_despite_out_of_order_arrivals() {
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+        let blocks = block_chain(4);
+        let expected: Vec<BlockHash> = blocks.iter().map(|b| b.block_hash()).collect();
+
+        let mut d = DownloadState::default();
+        for i in [1, 3, 0, 2] {
+            d.buffer_block(blocks[i].header.prev_blockhash, blocks[i].clone().convert());
+        }
+
+        let mut connected = Connected::default();
+        connected.connect(genesis);
+        assert_eq!(drain(&mut d, &mut connected), expected);
+    }
+
+    #[test]
+    fn buffer_holds_blocks_until_parent_arrives() {
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+        let blocks = block_chain(2);
+        let mut connected = Connected::default();
+        connected.connect(genesis);
+
+        // Not idle, so the competing branch path stays shut.
+        let mut d = download(&[], &[hash(9)]);
+        d.buffer_block(blocks[1].header.prev_blockhash, blocks[1].clone().convert());
+        assert!(drain(&mut d, &mut connected).is_empty());
+
+        d.buffer_block(blocks[0].header.prev_blockhash, blocks[0].clone().convert());
+        assert_eq!(
+            drain(&mut d, &mut connected),
+            vec![blocks[0].block_hash(), blocks[1].block_hash()]
+        );
+    }
+
+    #[test]
+    fn buffer_yields_nothing_when_no_parent_is_connected() {
+        let blocks = block_chain(2);
+        let mut d = download(&[], &[hash(9)]);
+        d.buffer_block(blocks[1].header.prev_blockhash, blocks[1].clone().convert());
+
+        assert!(d
+            .take_connectable(Connected::default().contains())
+            .is_none());
+    }
+
+    #[test]
+    fn competing_branch_is_released_in_order_once_peers_are_idle() {
+        // Nothing here builds on the active chain.
+        let blocks = block_chain(4);
+        let mut d = DownloadState::default();
+        for i in [3, 1, 2] {
+            d.buffer_block(blocks[i].header.prev_blockhash, blocks[i].clone().convert());
+        }
+
+        assert_eq!(
+            drain(&mut d, &mut Connected::default()),
+            vec![
+                blocks[1].block_hash(),
+                blocks[2].block_hash(),
+                blocks[3].block_hash()
+            ]
+        );
+    }
+
+    #[test]
+    fn competing_branch_waits_while_a_peer_still_owes_blocks() {
+        let blocks = block_chain(2);
+        let mut d = download(&[], &[hash(9)]);
+        d.buffer_block(blocks[1].header.prev_blockhash, blocks[1].clone().convert());
+
+        assert!(d
+            .take_connectable(Connected::default().contains())
+            .is_none());
+
+        d.release(&hash(9));
+        assert!(d
+            .take_connectable(Connected::default().contains())
+            .is_some());
     }
 }
