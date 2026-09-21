@@ -8,4 +8,5 @@ interface Server {
     shutdown @1 () -> ();
     makeWallet @2 () -> (wallet :Wallet.Wallet);
     makeChain @3 () -> (chain :Chain.Chain);
+    network @4 () -> (network :Text);
 }

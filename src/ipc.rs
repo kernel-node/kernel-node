@@ -3,7 +3,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use bitcoin::consensus::Decodable;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{SecretKey, XOnlyPublicKey};
-use bitcoin::{Amount, BlockHash, FeeRate, Transaction};
+use bitcoin::{Amount, BlockHash, FeeRate, Network, Transaction};
 use bitcoinkernel::{core::BlockHashExt, ChainstateManager};
 use wallet::silentpayments::{Recipient, Wallet};
 
@@ -14,6 +14,7 @@ pub struct IpcInterface {
     broadcast_tx: mpsc::SyncSender<Transaction>,
     state: Arc<Mutex<Wallet>>,
     chainman: Arc<ChainstateManager>,
+    network: Network,
 }
 
 impl IpcInterface {
@@ -22,12 +23,14 @@ impl IpcInterface {
         broadcast_tx: mpsc::SyncSender<Transaction>,
         state: Arc<Mutex<Wallet>>,
         chainman: Arc<ChainstateManager>,
+        network: Network,
     ) -> Self {
         Self {
             tx,
             broadcast_tx,
             state,
             chainman,
+            network,
         }
     }
 }
@@ -76,6 +79,15 @@ impl server_capnp::server::Server for IpcInterface {
         let client: chain_capnp::chain::Client =
             capnp_rpc::new_client(ChainIpcInterface::new(self.chainman.clone()));
         results.get().set_chain(client);
+        Ok(())
+    }
+
+    async fn network(
+        self: capnp::capability::Rc<Self>,
+        _: server_capnp::server::NetworkParams,
+        mut results: server_capnp::server::NetworkResults,
+    ) -> Result<(), capnp::Error> {
+        results.get().set_network(self.network.to_string());
         Ok(())
     }
 }

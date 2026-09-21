@@ -632,7 +632,7 @@ fn main() {
                         let (reader, writer) = stream.into_split();
                         let buf_reader = futures::io::BufReader::new(reader.compat());
                         let buf_writer = futures::io::BufWriter::new(writer.compat_write());
-                        let network = capnp_rpc::twoparty::VatNetwork::new(
+                        let vat_network = capnp_rpc::twoparty::VatNetwork::new(
                             buf_reader,
                             buf_writer,
                             capnp_rpc::rpc_twoparty_capnp::Side::Server,
@@ -643,9 +643,10 @@ fn main() {
                             broadcast_tx.clone(),
                             state,
                             chainman,
+                            network,
                         ));
                         let rpc_system =
-                            capnp_rpc::RpcSystem::new(Box::new(network), Some(client.client));
+                            capnp_rpc::RpcSystem::new(Box::new(vat_network), Some(client.client));
                         tokio::task::spawn_local(rpc_system);
                     }
                 })

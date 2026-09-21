@@ -1,7 +1,13 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use bitcoin::hex::FromHex;
 use bitcoin::secp256k1::{rand::rngs::OsRng, Secp256k1, SecretKey, XOnlyPublicKey};
+use bitcoin::Network;
+use bitcoin_payment_instructions::dns_resolver::DNSHrnResolver;
+use bitcoin_payment_instructions::{
+    PaymentInstructions, PaymentMethod, PossiblyResolvedPaymentMethod,
+};
 use clap::Parser;
 use kernel_node::ext::DirnameExt;
 use kernel_node::server_capnp::server;
@@ -112,6 +118,31 @@ enum WalletCmd {
         /// use more inputs and consolidate the UTXO set to be fewer.
         consolidate_fee_rate_sat_per_vb: Option<f64>,
     },
+    /// Resolve a BIP 353 human-readable name over DNSSEC and send to the
+    /// on-chain or silent payment address it points to.
+    PayToDomain {
+        /// The BIP 353 human-readable name, in `name@domain` form.
+        domain: String,
+        /// Amount to send, in satoshis.
+        amount_sat: u64,
+        /// Fee rate, in satoshis per virtual byte.
+        fee_rate_sat_per_vb: f64,
+        /// The maximum feerate in sats/vB at which transaction building may
+        /// use more inputs than strictly necessary so that the wallet's UTXO
+        /// pool can be reduced (default: 10 sats/vB).  Long term fee rate,
+        /// in satoshis per virtual byte.
+        ///
+        /// Setting the consolidate fee rate helps the coin-selection
+        /// algorithm know if to use more UTXOs or less when building a
+        /// transaction.  That is, if the current fee rate is high
+        /// (fee rate > consolidate fee rate), then consume less inputs making
+        /// the transaction cheaper.  Likewise, if the current fee rate is low,
+        /// use more inputs and consolidate the UTXO set to be fewer.
+        consolidate_fee_rate_sat_per_vb: Option<f64>,
+        /// The recursive DNS resolver to use for DNSSEC resolution.
+        #[arg(long, default_value = "8.8.8.8:53")]
+        dns: SocketAddr,
+    },
 }
 
 fn generate_keys() -> (SecretKey, SecretKey, XOnlyPublicKey) {
@@ -120,6 +151,47 @@ fn generate_keys() -> (SecretKey, SecretKey, XOnlyPublicKey) {
     let spend_priv = SecretKey::new(&mut OsRng);
     let (spend_xonly, _) = spend_priv.public_key(&secp).x_only_public_key();
     (scan_priv, spend_priv, spend_xonly)
+}
+
+/// Resolves a BIP 353 human-readable name over DNSSEC, returning the first
+/// silent payment or on-chain address it contains.
+async fn resolve_domain(domain: &str, network: Network, dns: SocketAddr) -> String {
+    let resolver = DNSHrnResolver(dns);
+    let instructions = PaymentInstructions::parse(domain, network, &resolver, true)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("failed to resolve {domain}: {e:?}");
+            std::process::exit(1);
+        });
+
+    let methods: Vec<&PaymentMethod> = match &instructions {
+        PaymentInstructions::FixedAmount(instr) => instr.methods().iter().collect(),
+        PaymentInstructions::ConfigurableAmount(instr) => instr
+            .methods()
+            .filter_map(|method| match method {
+                PossiblyResolvedPaymentMethod::Resolved(payment_method) => Some(payment_method),
+                PossiblyResolvedPaymentMethod::LNURLPay { .. } => None,
+            })
+            .collect(),
+    };
+
+    // Prefer silent payments, falling back to a plain on-chain address.
+    methods
+        .iter()
+        .find_map(|method| match method {
+            PaymentMethod::SilentPayment(address) => Some(address.to_string()),
+            _ => None,
+        })
+        .or_else(|| {
+            methods.iter().find_map(|method| match method {
+                PaymentMethod::OnChain(address) => Some(address.to_string()),
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| {
+            eprintln!("no on-chain or silent payment instructions found for {domain}");
+            std::process::exit(1);
+        })
 }
 
 async fn connect_server(datadir_path: &str) -> server::Client {
@@ -220,7 +292,7 @@ fn main() {
             }
             Commands::Wallet(cmd) => {
                 let wallet_response = client.make_wallet_request().send().promise.await.unwrap();
-                let client = wallet_response.get().unwrap().get_wallet().unwrap();
+                let wallet_client = wallet_response.get().unwrap().get_wallet().unwrap();
                 match cmd {
                     WalletCmd::GenerateKeys { .. } => unreachable!("handled before runtime"),
                     WalletCmd::PrintKeysFromKeysFile { .. } => {
@@ -235,7 +307,7 @@ fn main() {
                         let spend_bytes =
                             Vec::<u8>::from_hex(&spend_key).expect("spend_key must be valid hex");
 
-                        let mut req = client.import_keys_request();
+                        let mut req = wallet_client.import_keys_request();
                         req.get().set_scan_key(&scan_bytes);
                         req.get().set_spend_key(&spend_bytes);
                         let result = req.send().promise.await.unwrap();
@@ -244,7 +316,7 @@ fn main() {
                         println!("{}", msg);
                     }
                     WalletCmd::Balance => {
-                        let req = client.get_balance_request();
+                        let req = wallet_client.get_balance_request();
                         let result = req.send().promise.await.unwrap();
                         let r = result.get().unwrap();
                         println!(
@@ -255,7 +327,7 @@ fn main() {
                         );
                     }
                     WalletCmd::History => {
-                        let req = client.get_history_request();
+                        let req = wallet_client.get_history_request();
                         let result = req.send().promise.await.unwrap();
                         let r = result.get().unwrap();
                         let entries = r.get_entries().unwrap().to_string().unwrap();
@@ -266,7 +338,7 @@ fn main() {
                         }
                     }
                     WalletCmd::Receive => {
-                        let req = client.receive_request();
+                        let req = wallet_client.receive_request();
                         let result = req.send().promise.await.unwrap();
                         let r = result.get().unwrap();
                         let address = r.get_address().unwrap().to_string().unwrap();
@@ -274,7 +346,7 @@ fn main() {
                     }
                     WalletCmd::BroadcastRawTx { tx } => {
                         let raw_bytes = Vec::<u8>::from_hex(&tx).expect("tx must be valid hex");
-                        let mut req = client.broadcast_raw_tx_request();
+                        let mut req = wallet_client.broadcast_raw_tx_request();
                         req.get().set_tx(&raw_bytes);
                         let result = req.send().promise.await.unwrap();
                         let r = result.get().unwrap();
@@ -287,7 +359,49 @@ fn main() {
                         fee_rate_sat_per_vb,
                         consolidate_fee_rate_sat_per_vb,
                     } => {
-                        let mut req = client.send_to_address_request();
+                        let mut req = wallet_client.send_to_address_request();
+                        req.get().set_address(&address);
+                        req.get().set_amount_sat(amount_sat);
+                        req.get().set_fee_rate_sat_per_vb(fee_rate_sat_per_vb);
+
+                        if let Some(consolidate_fee_rate) = consolidate_fee_rate_sat_per_vb {
+                            req.get()
+                                .set_consolidate_fee_rate_sat_per_vb(consolidate_fee_rate);
+                        }
+
+                        let result = req.send().promise.await.unwrap();
+                        let r = result.get().unwrap();
+                        let message = r.get_message().unwrap().to_string().unwrap();
+                        if r.get_ok() {
+                            println!("{}", message);
+                        } else {
+                            eprintln!("{}", message);
+                            std::process::exit(1);
+                        }
+                    }
+                    WalletCmd::PayToDomain {
+                        domain,
+                        amount_sat,
+                        fee_rate_sat_per_vb,
+                        consolidate_fee_rate_sat_per_vb,
+                        dns,
+                    } => {
+                        let network_response =
+                            client.network_request().send().promise.await.unwrap();
+                        let network = network_response
+                            .get()
+                            .unwrap()
+                            .get_network()
+                            .unwrap()
+                            .to_string()
+                            .unwrap()
+                            .parse::<Network>()
+                            .expect("node returned an invalid network");
+
+                        let address = resolve_domain(&domain, network, dns).await;
+                        println!("Resolved {domain} to {address}");
+
+                        let mut req = wallet_client.send_to_address_request();
                         req.get().set_address(&address);
                         req.get().set_amount_sat(amount_sat);
                         req.get().set_fee_rate_sat_per_vb(fee_rate_sat_per_vb);
