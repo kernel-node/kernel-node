@@ -12,6 +12,7 @@ pub mod ext;
 pub mod ipc;
 pub mod peer;
 pub mod peer_manager;
+pub mod socks5;
 
 pub mod logging {
     pub struct Category;

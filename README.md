@@ -27,6 +27,7 @@ Arguments:
         --connect        Connect only to this node (format: ip:port or hostname:port)
         --daemon         Run the server as a daemon
         --sp-keys-file   Path to a binary silent payments keys file to import at startup.
+        --proxy          Socks5 proxy for outbound peer connections (format: ip:port).
 ```
 
 Or use the interactive wizard to walk through the options and start the node:

@@ -217,6 +217,12 @@ fn main() {
         }
     };
 
+    let proxy = if prompt_yes_no("Route peer connections through a Socks5 proxy?", false) {
+        Some(prompt_with_default("Proxy address", "127.0.0.1:9050"))
+    } else {
+        None
+    };
+
     let daemon = prompt_yes_no("Run as daemon?", false);
 
     let mut args: Vec<String> = vec![
@@ -237,6 +243,10 @@ fn main() {
     if let Some(k) = sp_keys_file {
         args.push("--sp-keys-file".into());
         args.push(k);
+    }
+    if let Some(p) = proxy {
+        args.push("--proxy".into());
+        args.push(p);
     }
     if daemon {
         args.push("--daemon=true".into());
