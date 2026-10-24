@@ -8,7 +8,7 @@ use std::{
 use bitcoin::{
     hashes::Hash,
     p2p::{
-        address::AddrV2Message,
+        address::{AddrV2, AddrV2Message},
         message::NetworkMessage,
         message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory},
         ServiceFlags,
@@ -117,7 +117,7 @@ impl DownloadState {
 }
 
 pub struct NodeState {
-    pub addr_tx: mpsc::Sender<Vec<AddrV2Message>>,
+    pub addr_tx: mpsc::Sender<(AddrV2, Vec<AddrV2Message>)>,
     pub context: Arc<Context>,
     pub chainman: Arc<ChainstateManager>,
     pub download: Mutex<DownloadState>,
@@ -296,6 +296,7 @@ fn create_getdata_message(block_hashes: &[bitcoin::BlockHash]) -> NetworkMessage
 pub fn process_message(
     state_machine: PeerStateMachine,
     event: NetworkMessage,
+    source: &AddrV2,
     node_state: &NodeState,
 ) -> (PeerStateMachine, Vec<NetworkMessage>) {
     // Always process the ping first as a special case.
@@ -307,7 +308,7 @@ pub fn process_message(
     if let NetworkMessage::AddrV2(payload) = event {
         info!(target: Category::NET, "Received {} net addresses", payload.len());
         // If the address manager has a full queue these net addresses should be dropped.
-        let _ = node_state.addr_tx.send(payload);
+        let _ = node_state.addr_tx.send((source.clone(), payload));
         return (state_machine, vec![]);
     }
 
@@ -555,7 +556,8 @@ impl BitcoinPeer {
         let msg = self.receive_message()?;
         let delivered = delivers_requested_block(&self.state_machine, &msg);
         let old_state = std::mem::take(&mut self.state_machine);
-        let (peer_state_machine, mut messages) = process_message(old_state, msg, node_state);
+        let (peer_state_machine, mut messages) =
+            process_message(old_state, msg, &self.dest.addr, node_state);
         self.state_machine = peer_state_machine;
         let requested = messages.iter().any(|message| {
             matches!(

@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     net::SocketAddr,
     ops::DerefMut,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -22,7 +23,7 @@ use p2p::{
 use crate::{
     logging::Category,
     net::{
-        addr::{AddrTable, Destination},
+        addr::{AddrTable, AddrTableExt, Destination},
         peer::{BitcoinPeer, NodeState},
         socks5::{OnionAddress, Socks5Proxy},
     },
@@ -39,6 +40,7 @@ const EMPTY_ADDRESS_BOOK_LIMIT: u32 = 60;
 const BROADCAST_TIMEOUT: Duration = Duration::from_secs(60);
 const BROADCAST_PONG_TIMEOUT: Duration = Duration::from_secs(5);
 const FEELER_INTERVAL: Duration = Duration::from_secs(30);
+const FLUSH_PEERS_INTERVAL: Duration = Duration::from_secs(60 * 10);
 
 pub struct PeerManager {
     max_peers: usize,
@@ -52,6 +54,8 @@ pub struct PeerManager {
     connected_peers: Arc<Mutex<HashSet<Destination>>>,
     proxy: Option<Socks5Proxy>,
     feeler_thread: Option<thread::JoinHandle<()>>,
+    peers_file: Option<PathBuf>,
+    flush_peers_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl PeerManager {
@@ -59,6 +63,7 @@ impl PeerManager {
         addrman: Arc<Mutex<AddrTable>>,
         node_state: Arc<NodeState>,
         network: Network,
+        peers_file: Option<PathBuf>,
         fatal: FatalShutdown,
     ) -> Self {
         Self {
@@ -73,6 +78,8 @@ impl PeerManager {
             connected_peers: Arc::new(Mutex::new(HashSet::new())),
             proxy: None,
             feeler_thread: None,
+            peers_file,
+            flush_peers_thread: None,
         }
     }
 
@@ -217,6 +224,26 @@ impl PeerManager {
             info!(target: Category::NODE, "Stopping feeler thread.");
         });
         self.feeler_thread = Some(handle);
+
+        if let Some(path) = self.peers_file.clone() {
+            let running = Arc::clone(&self.running);
+            let addrman = Arc::clone(&self.addrman);
+            let handle = thread::spawn(move || {
+                info!(target: Category::NODE, "Starting peer flush thread.");
+                let mut last_flush = Instant::now();
+                while running.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_secs(1));
+                    if last_flush.elapsed() < FLUSH_PEERS_INTERVAL {
+                        continue;
+                    }
+                    flush_peers(&addrman, &path);
+                    last_flush = Instant::now();
+                }
+                flush_peers(&addrman, &path);
+                info!(target: Category::NODE, "Stopping peer flush thread.");
+            });
+            self.flush_peers_thread = Some(handle);
+        }
     }
 
     pub fn stop(&self) {
@@ -233,6 +260,9 @@ impl PeerManager {
             let _ = handle.join();
         }
         if let Some(handle) = self.feeler_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.flush_peers_thread.take() {
             let _ = handle.join();
         }
     }
@@ -297,6 +327,13 @@ pub(crate) fn connect(
             };
             Ok((writer, reader))
         }
+    }
+}
+
+fn flush_peers(addrman: &Mutex<AddrTable>, path: &Path) {
+    match addrman.lock().unwrap().save(path) {
+        Ok(()) => debug!(target: Category::NET, "Wrote address book to {}", path.display()),
+        Err(e) => warn!(target: Category::NET, "Failed to write {}: {e}", path.display()),
     }
 }
 

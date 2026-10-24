@@ -106,7 +106,14 @@ impl TestNode {
     }
 
     pub fn start_connected_to(peers: &[String], keys: Option<SilentPaymentKeysFile>) -> Self {
-        let tempdir = tempfile::tempdir().unwrap();
+        Self::start_in(tempfile::tempdir().unwrap(), peers, keys)
+    }
+
+    pub fn start_in(
+        tempdir: tempfile::TempDir,
+        peers: &[String],
+        keys: Option<SilentPaymentKeysFile>,
+    ) -> Self {
         let datadir = tempdir.path().canonicalize().unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_node"));
         command
