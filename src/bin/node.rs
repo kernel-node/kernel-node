@@ -25,7 +25,7 @@ use kernel_node::{
     ipc::{server_capnp::server, IpcInterface},
     logging::Category,
     net::{
-        addr::{resolve_seeds, AddrTable},
+        addr::{resolve_seeds, AddrTable, AddrTableExt},
         manager::PeerManager,
         peer::{DownloadState, NodeState},
         socks5::Socks5Proxy,
@@ -156,11 +156,12 @@ fn run(
     proxy: Option<Socks5Proxy>,
     node_state: NodeState,
     shutdown_rx: mpsc::Receiver<()>,
-    addr_rx: mpsc::Receiver<Vec<AddrV2Message>>,
+    addr_rx: mpsc::Receiver<(AddrV2, Vec<AddrV2Message>)>,
     scan_rx: mpsc::Receiver<ScanEvent>,
     broadcast_rx: mpsc::Receiver<Transaction>,
     wallet: Arc<Mutex<Wallet>>,
     wallet_store: WalletStore,
+    peers_file: PathBuf,
     fatal: FatalShutdown,
 ) -> std::io::Result<()> {
     let mut table = AddrTable::new();
@@ -185,24 +186,27 @@ fn run(
             }
         }
         true => {
-            let addresses = resolve_seeds(network);
-            info!(target: Category::NET, "Resolved {} addresses from DNS seeds", addresses.len());
-            for addr in &addresses {
-                let record = match addr {
-                    IpAddr::V4(ipv4) => addrman::Record::new(
-                        AddrV2::Ipv4(*ipv4),
-                        network.default_p2p_port(),
-                        ServiceFlags::NETWORK,
-                        &DNS_RESOLVER,
-                    ),
-                    IpAddr::V6(ipv6) => addrman::Record::new(
-                        AddrV2::Ipv6(*ipv6),
-                        network.default_p2p_port(),
-                        ServiceFlags::NETWORK,
-                        &DNS_RESOLVER,
-                    ),
-                };
-                table.add(&record);
+            table = AddrTable::load(&peers_file);
+            if table.is_empty() {
+                let addresses = resolve_seeds(network);
+                info!(target: Category::NET, "Resolved {} addresses from DNS seeds", addresses.len());
+                for addr in &addresses {
+                    let record = match addr {
+                        IpAddr::V4(ipv4) => addrman::Record::new(
+                            AddrV2::Ipv4(*ipv4),
+                            network.default_p2p_port(),
+                            ServiceFlags::NETWORK,
+                            &DNS_RESOLVER,
+                        ),
+                        IpAddr::V6(ipv6) => addrman::Record::new(
+                            AddrV2::Ipv6(*ipv6),
+                            network.default_p2p_port(),
+                            ServiceFlags::NETWORK,
+                            &DNS_RESOLVER,
+                        ),
+                    };
+                    table.add(&record);
+                }
             }
         }
     };
@@ -224,6 +228,7 @@ fn run(
         Arc::clone(&addrman),
         Arc::clone(&node_state),
         network,
+        connect.is_empty().then_some(peers_file),
         fatal.clone(),
     );
     if !connect.is_empty() {
@@ -241,14 +246,17 @@ fn run(
         info!(target: Category::NODE, "Starting addr processing thread.");
         while running_addr.load(Ordering::SeqCst) {
             match addr_rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(payload) => {
+                Ok((source, payload)) => {
                     let mut addr_lock = addrman.lock().unwrap();
                     for address in payload {
-                        let record = addrman::Record::new(
+                        if let AddrV2::Unknown(..) = address.addr {
+                            continue;
+                        }
+                        let record = addrman::Record::new_from_addrv2_source(
                             address.addr,
                             address.port,
                             address.services,
-                            &DNS_RESOLVER,
+                            &source,
                         );
                         addr_lock.add(&record);
                     }
@@ -483,6 +491,7 @@ fn main() {
 
     let data_dir = config.datadir.data_dir();
     let blocks_dir = data_dir.clone() + "/blocks";
+    let peers_file = PathBuf::from(&data_dir).join("peers.bin");
     let chainman_builder = ChainstateManagerBuilder::new(&context, &data_dir, &blocks_dir)
         .unwrap()
         .worker_threads(
@@ -578,6 +587,7 @@ fn main() {
         broadcast_rx,
         wallet,
         wallet_store,
+        peers_file,
         fatal,
     )
     .unwrap();
