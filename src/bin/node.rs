@@ -526,11 +526,12 @@ fn main() {
 
     let wallet_for_ipc = Arc::clone(&wallet);
     let chainman_for_ipc = Arc::clone(&node_state.chainman);
+    let (ipc_stop_tx, mut ipc_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    std::thread::spawn(move || {
+    let ipc_thread = std::thread::spawn(move || {
         rt.block_on(async move {
             tokio::task::LocalSet::new()
                 .run_until(async move {
@@ -546,6 +547,10 @@ fn main() {
                             _ctrl_c = tokio::signal::ctrl_c() => {
                                 info!(target: Category::NODE, "Received shutdown signal");
                                 shutdown_tx.clone().send(()).unwrap();
+                                return;
+                            }
+                            _stop = &mut ipc_stop_rx => {
+                                debug!(target: Category::IPC, "Stopping the IPC listener");
                                 return;
                             }
                         };
@@ -591,4 +596,7 @@ fn main() {
         fatal,
     )
     .unwrap();
+
+    let _ = ipc_stop_tx.send(());
+    ipc_thread.join().unwrap();
 }
