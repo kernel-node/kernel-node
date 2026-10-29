@@ -89,7 +89,7 @@ async fn connect(socket_path: &Path) -> server::Client {
 pub struct TestNode {
     process: Child,
     datadir: PathBuf,
-    _tempdir: tempfile::TempDir,
+    tempdir: Option<tempfile::TempDir>,
     rt: tokio::runtime::Runtime,
 }
 
@@ -115,6 +115,7 @@ impl TestNode {
         keys: Option<SilentPaymentKeysFile>,
     ) -> Self {
         let datadir = tempdir.path().canonicalize().unwrap();
+        let _ = std::fs::remove_file(datadir.join("node.sock"));
         let mut command = Command::new(env!("CARGO_BIN_EXE_node"));
         command
             .arg("--network")
@@ -136,7 +137,7 @@ impl TestNode {
         let node = Self {
             process,
             datadir,
-            _tempdir: tempdir,
+            tempdir: Some(tempdir),
             rt,
         };
         node.wait_until_ready();
@@ -281,7 +282,7 @@ impl TestNode {
         }
     }
 
-    pub fn stop(mut self) {
+    pub fn stop(mut self) -> tempfile::TempDir {
         let out = self.cli(&["stop"]);
         assert!(
             out.status.success(),
@@ -291,7 +292,7 @@ impl TestNode {
         let deadline = Instant::now() + STOP_TIMEOUT;
         while Instant::now() < deadline {
             if self.process.try_wait().unwrap().is_some() {
-                return;
+                return self.tempdir.take().unwrap();
             }
             std::thread::sleep(POLL_INTERVAL);
         }

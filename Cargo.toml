@@ -24,7 +24,7 @@ wallet = { path = "crates/wallet" }
 ## IPC required dependencies
 capnp = "0.25"
 capnp-rpc = "0.25"
-tokio = { version = "1", features = ["net", "rt", "macros", "signal"] }
+tokio = { version = "1", features = ["net", "rt", "macros", "signal", "sync"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3.0"
 libc = "0.2"
