@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
@@ -306,12 +307,12 @@ impl TestNode {
     fn wait_until_ready(&self) {
         let deadline = Instant::now() + READY_TIMEOUT;
         while Instant::now() < deadline {
-            if Path::new(&self.socket_path()).exists() {
+            if UnixStream::connect(self.socket_path()).is_ok() {
                 return;
             }
             std::thread::sleep(POLL_INTERVAL);
         }
-        panic!("node did not create control socket within {READY_TIMEOUT:?}");
+        panic!("node did not accept on its control socket within {READY_TIMEOUT:?}");
     }
 }
 
