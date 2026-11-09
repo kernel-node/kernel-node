@@ -271,23 +271,23 @@ fn run(
     let node_state_block = Arc::clone(&node_state);
     let block_processing_handler = thread::spawn(move || {
         info!(target: Category::NODE, "Starting block processing thread.");
-        let mut last_block = Instant::now();
+        let mut tip = chainman.active_chain().tip().block_hash().to_owned();
+        let mut last_tip_change = Instant::now();
         while running_block.load(Ordering::SeqCst) {
-            match node_state_block.wait_for_connectable(Duration::from_secs(1)) {
-                Some(block) => {
-                    debug!(target: Category::KERNEL, "Validating block.");
-                    last_block = Instant::now();
-                    let _ = chainman.process_block(&block);
-                }
-                None => {
-                    if last_block.elapsed() > STALE_BLOCK_DURATION {
-                        last_block = Instant::now();
-                        info!(target: Category::NET, "Potential stale block. Dropping peers to find new ones.");
-                        for slot in &peer_writers {
-                            if let Some(conn) = slot.lock().unwrap().deref_mut() {
-                                let _ = conn.shutdown();
-                            }
-                        }
+            if let Some(block) = node_state_block.wait_for_connectable(Duration::from_secs(1)) {
+                debug!(target: Category::KERNEL, "Validating block.");
+                let _ = chainman.process_block(&block);
+            }
+            let current = chainman.active_chain().tip().block_hash().to_owned();
+            if current != tip {
+                tip = current;
+                last_tip_change = Instant::now();
+            } else if last_tip_change.elapsed() > STALE_BLOCK_DURATION {
+                last_tip_change = Instant::now();
+                info!(target: Category::NET, "Potential stale block. Dropping peers to find new ones.");
+                for slot in &peer_writers {
+                    if let Some(conn) = slot.lock().unwrap().deref_mut() {
+                        let _ = conn.shutdown();
                     }
                 }
             }
