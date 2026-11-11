@@ -4,7 +4,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, RecvTimeoutError},
-        Arc, Condvar, Mutex, Once,
+        Arc, Mutex, Once,
     },
     thread::{self, available_parallelism},
     time::{Duration, Instant},
@@ -157,6 +157,7 @@ fn run(
     node_state: NodeState,
     shutdown_rx: mpsc::Receiver<()>,
     addr_rx: mpsc::Receiver<(AddrV2, Vec<AddrV2Message>)>,
+    block_rx: mpsc::Receiver<bitcoinkernel::Block>,
     scan_rx: mpsc::Receiver<ScanEvent>,
     broadcast_rx: mpsc::Receiver<Transaction>,
     wallet: Arc<Mutex<Wallet>>,
@@ -271,23 +272,24 @@ fn run(
     let node_state_block = Arc::clone(&node_state);
     let block_processing_handler = thread::spawn(move || {
         info!(target: Category::NODE, "Starting block processing thread.");
-        let mut last_block = Instant::now();
+        let mut tip = chainman.active_chain().tip().block_hash().to_owned();
+        let mut last_tip_change = Instant::now();
         while running_block.load(Ordering::SeqCst) {
-            match node_state_block.wait_for_connectable(Duration::from_secs(1)) {
-                Some(block) => {
-                    debug!(target: Category::KERNEL, "Validating block.");
-                    last_block = Instant::now();
-                    let _ = chainman.process_block(&block);
-                }
-                None => {
-                    if last_block.elapsed() > STALE_BLOCK_DURATION {
-                        last_block = Instant::now();
-                        info!(target: Category::NET, "Potential stale block. Dropping peers to find new ones.");
-                        for slot in &peer_writers {
-                            if let Some(conn) = slot.lock().unwrap().deref_mut() {
-                                let _ = conn.shutdown();
-                            }
-                        }
+            if let Ok(block) = block_rx.recv_timeout(Duration::from_secs(1)) {
+                debug!(target: Category::KERNEL, "Validating block.");
+                let result = chainman.process_block(&block);
+                node_state_block.update_received(&block, result);
+            }
+            let current = chainman.active_chain().tip().block_hash().to_owned();
+            if current != tip {
+                tip = current;
+                last_tip_change = Instant::now();
+            } else if last_tip_change.elapsed() > STALE_BLOCK_DURATION {
+                last_tip_change = Instant::now();
+                info!(target: Category::NET, "Potential stale block. Dropping peers to find new ones.");
+                for slot in &peer_writers {
+                    if let Some(conn) = slot.lock().unwrap().deref_mut() {
+                        let _ = conn.shutdown();
                     }
                 }
             }
@@ -502,6 +504,7 @@ fn main() {
     let chainman = Arc::new(chainman_builder.build().unwrap());
 
     let (addr_tx, addr_rx) = mpsc::channel();
+    let (block_tx, block_rx) = mpsc::sync_channel(1);
     let (broadcast_tx, broadcast_rx) = mpsc::sync_channel::<Transaction>(1);
 
     let node_state = NodeState {
@@ -509,7 +512,7 @@ fn main() {
         chainman,
         context: Arc::clone(&context),
         download: Mutex::new(DownloadState::default()),
-        connectable: Condvar::new(),
+        block_tx,
     };
 
     if let Err(err) = node_state.chainman.import_blocks() {
@@ -588,6 +591,7 @@ fn main() {
         node_state,
         shutdown_rx,
         addr_rx,
+        block_rx,
         scan_rx,
         broadcast_rx,
         wallet,
