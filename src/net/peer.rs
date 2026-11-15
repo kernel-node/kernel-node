@@ -19,7 +19,7 @@ use bitcoinkernel::{
     core::BlockHashExt, BlockTreeEntry, ChainstateManager, Context, ProcessBlockHeaderResult,
     ProcessBlockResult,
 };
-use log::{debug, info, warn};
+use log::{debug, info, log_enabled, warn, Level};
 use p2p::{
     handshake::{ConnectionConfig, ProtocolVersion},
     net::{ConnectionReader, ConnectionWriter, READ_TIMEOUT},
@@ -512,6 +512,9 @@ impl BitcoinPeer {
         node_state: &NodeState,
     ) -> Result<(), p2p::net::Error> {
         let msg = self.receive_message()?;
+        if let NetworkMessage::Block(block) = &msg {
+            debug!(target: Category::NET, "Received block {} from {}", block.block_hash(), self);
+        }
         let delivered = delivers_requested_block(&self.state_machine, &msg);
         let old_state = std::mem::take(&mut self.state_machine);
         let (peer_state_machine, mut messages) =
@@ -527,6 +530,15 @@ impl BitcoinPeer {
             self.last_progress = Instant::now();
         }
         for message in messages.drain(..) {
+            if log_enabled!(target: Category::NET, Level::Debug) {
+                if let NetworkMessage::GetData(inventory) = &message {
+                    for item in inventory {
+                        if let Inventory::WitnessBlock(hash) = item {
+                            debug!(target: Category::NET, "Requesting block {} from {}", hash, self);
+                        }
+                    }
+                }
+            }
             self.writer.send_message(message)?
         }
         Ok(())
