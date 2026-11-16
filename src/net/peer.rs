@@ -305,6 +305,10 @@ pub fn process_message(
                             vec![create_getdata_message(&batch)],
                         );
                     }
+                    // Polling after an empty answer would loop.
+                    if msg_len == 0 {
+                        return (PeerStateMachine::AwaitingInv, vec![]);
+                    }
                     let locators = build_block_locators(node_state.chainman.active_chain().tip());
                     return (
                         PeerStateMachine::AwaitingInv,
