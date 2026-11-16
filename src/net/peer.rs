@@ -1,7 +1,8 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt, iter,
     sync::{mpsc, Arc, Mutex},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -34,38 +35,82 @@ use crate::{
 const PROTOCOL_VERSION: ProtocolVersion = 70015;
 const MAX_LOCATOR_HASHES: usize = 101;
 const DOWNLOAD_BATCH_SIZE: usize = 16;
-const PEER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+pub const PEER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+const PEER_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+/// Measured from the lowest unreceived block.
+pub const BLOCK_DOWNLOAD_WINDOW: i32 = 1024;
+pub const BLOCK_STALLING_TIMEOUT_DEFAULT: Duration = Duration::from_secs(2);
+const BLOCK_STALLING_TIMEOUT_MAX: Duration = Duration::from_secs(64);
 
-#[derive(Default)]
+// Field order sets the queue order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct BlockId {
+    height: i32,
+    hash: BlockHash,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Stall {
+    block: BlockHash,
+    since: Instant,
+}
+
 pub struct DownloadState {
-    queue: VecDeque<BlockHash>,
-    in_flight: HashSet<BlockHash>,
+    queue: BTreeSet<BlockId>,
+    in_flight: HashMap<BlockHash, i32>,
     received: HashSet<BlockHash>,
+    stall: Option<Stall>,
+    stalling_timeout: Duration,
+}
+
+impl Default for DownloadState {
+    fn default() -> Self {
+        DownloadState {
+            queue: BTreeSet::new(),
+            in_flight: HashMap::new(),
+            received: HashSet::new(),
+            stall: None,
+            stalling_timeout: BLOCK_STALLING_TIMEOUT_DEFAULT,
+        }
+    }
 }
 
 impl DownloadState {
     fn pop_batch(&mut self, batch_size: usize) -> Vec<BlockHash> {
+        let Some(first) = self.queue.first() else {
+            return Vec::new();
+        };
+        let lowest = self
+            .in_flight
+            .values()
+            .copied()
+            .fold(first.height, i32::min);
         let mut batch = Vec::with_capacity(batch_size);
         while batch.len() < batch_size {
-            let Some(hash) = self.queue.pop_front() else {
+            let Some(&BlockId { height, hash }) = self.queue.first() else {
                 break;
             };
-            if self.in_flight.insert(hash) {
+            if height >= lowest + BLOCK_DOWNLOAD_WINDOW {
+                break;
+            }
+            self.queue.pop_first();
+            if self.in_flight.insert(hash, height).is_none() {
                 batch.push(hash);
             }
         }
         batch
     }
 
-    fn claim(&mut self, hashes: Vec<BlockHash>) -> Vec<BlockHash> {
-        hashes
+    fn claim(&mut self, blocks: Vec<BlockId>) -> Vec<BlockHash> {
+        blocks
             .into_iter()
-            .filter(|hash| self.in_flight.insert(*hash))
+            .filter(|block| self.in_flight.insert(block.hash, block.height).is_none())
+            .map(|block| block.hash)
             .collect()
     }
 
     fn receive(&mut self, hash: BlockHash) -> bool {
-        if !self.in_flight.remove(&hash) {
+        if self.in_flight.remove(&hash).is_none() {
             return false;
         }
         self.received.insert(hash);
@@ -73,21 +118,82 @@ impl DownloadState {
     }
 
     fn requeue_unreceived(&mut self, inventory: &HashSet<BlockHash>) {
-        if inventory.is_empty() {
-            return;
-        }
+        self.clear_stall_held_by(inventory);
+        let mut requeued = 0;
         for hash in inventory {
-            self.in_flight.remove(hash);
-            self.queue.push_front(*hash);
+            if let Some(height) = self.in_flight.remove(hash) {
+                self.queue.insert(BlockId {
+                    height,
+                    hash: *hash,
+                });
+                requeued += 1;
+            }
         }
-        debug!(target: Category::NET, "Re-enqueued {} unreceived blocks", inventory.len());
+        if requeued > 0 {
+            debug!(target: Category::NET, "Re-enqueued {} unreceived blocks", requeued);
+        }
     }
 
-    fn forget_connected(&mut self, active_from_tip: impl IntoIterator<Item = BlockHash>) {
+    fn forget_connected(&mut self, active_from_tip: impl IntoIterator<Item = BlockHash>) -> usize {
+        let mut connected = 0;
         for hash in active_from_tip {
             if !self.received.remove(&hash) {
                 break;
             }
+            connected += 1;
+        }
+        connected
+    }
+
+    fn mark_stall(&mut self) {
+        if let Some(stall) = &self.stall {
+            if self.in_flight.contains_key(&stall.block) {
+                return;
+            }
+        }
+        let lowest = self
+            .in_flight
+            .iter()
+            .min_by_key(|(_, &height)| height)
+            .map(|(&hash, _)| hash);
+        self.stall = lowest.map(|block| {
+            debug!(target: Category::NET, "Block {} is holding back the window", block);
+            Stall {
+                block,
+                since: Instant::now(),
+            }
+        });
+    }
+
+    fn clear_stall_held_by(&mut self, inventory: &HashSet<BlockHash>) {
+        if self
+            .stall
+            .as_ref()
+            .is_some_and(|stall| inventory.contains(&stall.block))
+        {
+            self.stall = None;
+        }
+    }
+
+    fn expire_stall_held_by(&mut self, inventory: &HashSet<BlockHash>) -> bool {
+        let Some(stall) = &self.stall else {
+            return false;
+        };
+        if !inventory.contains(&stall.block) || stall.since.elapsed() < self.stalling_timeout {
+            return false;
+        }
+        self.stall = None;
+        self.stalling_timeout = (self.stalling_timeout * 2).min(BLOCK_STALLING_TIMEOUT_MAX);
+        true
+    }
+
+    fn shorten_stalling_timeout(&mut self, blocks_connected: usize) {
+        for _ in 0..blocks_connected {
+            if self.stalling_timeout <= BLOCK_STALLING_TIMEOUT_DEFAULT {
+                break;
+            }
+            let shorter = Duration::from_secs(self.stalling_timeout.as_secs() * 85 / 100);
+            self.stalling_timeout = shorter.max(BLOCK_STALLING_TIMEOUT_DEFAULT);
         }
     }
 }
@@ -109,10 +215,11 @@ impl NodeState {
                 .remove(&BlockHash::from_byte_array(block.hash().into()));
         }
         let tip = self.chainman.active_chain().tip();
-        state.forget_connected(
+        let connected = state.forget_connected(
             iter::successors(Some(tip), |entry| entry.prev())
                 .map(|entry| BlockHash::from_byte_array(entry.block_hash().to_bytes())),
         );
+        state.shorten_stalling_timeout(connected);
     }
 }
 
@@ -130,11 +237,11 @@ impl NodeState {
 ///         │                 │ then take the first batch
 ///         │                 ▼
 ///         │    ┌─────────────────┐   block arrives (batch not done), or
-///         │    │  AwaitingBlock  │──┐  batch done + queue has more:
+///         │    │  AwaitingBlock  │──┐  batch done + window has more:
 ///         │    └─────────────────┘◀─┘  take the next batch
 ///         │       ▲         │
-///         │  inv/ │         │ batch done AND queue empty
-///         │  hdrs │         ▼
+///         │ hdrs/ │         │ batch done AND nothing to take
+///         │  idle │         ▼
 ///         │    ┌─────────────────┐   nothing to claim: ask again
 ///         └────│   AwaitingInv   │──┐
 ///              └─────────────────┘◀─┘
@@ -193,7 +300,10 @@ fn populate_download_queue(chainman: &ChainstateManager, download: &Mutex<Downlo
         if active.contains(&current) {
             break BlockHash::from_byte_array(current.block_hash().to_bytes());
         }
-        hashes.push(BlockHash::from_byte_array(current.block_hash().to_bytes()));
+        hashes.push(BlockId {
+            height: current.height(),
+            hash: BlockHash::from_byte_array(current.block_hash().to_bytes()),
+        });
         match current.prev() {
             Some(prev) => current = prev,
             None => return,
@@ -203,14 +313,15 @@ fn populate_download_queue(chainman: &ChainstateManager, download: &Mutex<Downlo
         return;
     }
     let fork_height = best_height - hashes.len() as i32;
-    hashes.reverse();
     let mut state = download.lock().unwrap();
     if !state.queue.is_empty() {
         return;
     }
-    let queued: VecDeque<BlockHash> = hashes
+    let queued: BTreeSet<BlockId> = hashes
         .into_iter()
-        .filter(|hash| !state.received.contains(hash) && !state.in_flight.contains(hash))
+        .filter(|block| {
+            !state.received.contains(&block.hash) && !state.in_flight.contains_key(&block.hash)
+        })
         .collect();
     if queued.is_empty() {
         return;
@@ -249,6 +360,35 @@ fn create_getdata_message(block_hashes: &[bitcoin::BlockHash]) -> NetworkMessage
         .collect();
 
     NetworkMessage::GetData(inventory)
+}
+
+fn request_blocks(batch: Vec<BlockHash>) -> (PeerStateMachine, Vec<NetworkMessage>) {
+    let message = create_getdata_message(&batch);
+    (
+        PeerStateMachine::AwaitingBlock(AwaitingBlock {
+            peer_inventory: batch.into_iter().collect(),
+        }),
+        vec![message],
+    )
+}
+
+fn request_next_batch(node_state: &NodeState) -> (PeerStateMachine, Vec<NetworkMessage>) {
+    let mut download = node_state.download.lock().unwrap();
+    let batch = download.pop_batch(DOWNLOAD_BATCH_SIZE);
+    if !batch.is_empty() {
+        return request_blocks(batch);
+    }
+    // Polling while the window is full would loop.
+    if !download.queue.is_empty() {
+        download.mark_stall();
+        return (PeerStateMachine::AwaitingInv, vec![]);
+    }
+    drop(download);
+    let locators = build_block_locators(node_state.chainman.active_chain().tip());
+    (
+        PeerStateMachine::AwaitingInv,
+        vec![create_getblocks_message(locators)],
+    )
 }
 
 pub fn process_message(
@@ -290,24 +430,7 @@ pub fn process_message(
 
                 if msg_len != 2000 {
                     populate_download_queue(&node_state.chainman, &node_state.download);
-                    let batch = node_state
-                        .download
-                        .lock()
-                        .unwrap()
-                        .pop_batch(DOWNLOAD_BATCH_SIZE);
-                    if !batch.is_empty() {
-                        return (
-                            PeerStateMachine::AwaitingBlock(AwaitingBlock {
-                                peer_inventory: batch.iter().cloned().collect(),
-                            }),
-                            vec![create_getdata_message(&batch)],
-                        );
-                    }
-                    let locators = build_block_locators(node_state.chainman.active_chain().tip());
-                    return (
-                        PeerStateMachine::AwaitingInv,
-                        vec![create_getblocks_message(locators)],
-                    );
+                    return request_next_batch(node_state);
                 }
 
                 let locators = build_block_locators(node_state.chainman.best_entry().unwrap());
@@ -334,7 +457,17 @@ pub fn process_message(
                         warn!(target: Category::KERNEL, "Rejected announced header {}", block_hash);
                         break;
                     }
-                    announced.push(block_hash);
+                    let height = node_state
+                        .chainman
+                        .get_block_tree_entry(&bitcoinkernel::BlockHash::from(
+                            block_hash.to_byte_array(),
+                        ))
+                        .expect("a valid header is in the block tree")
+                        .height();
+                    announced.push(BlockId {
+                        height,
+                        hash: block_hash,
+                    });
                 }
 
                 if announced.is_empty() {
@@ -395,26 +528,7 @@ pub fn process_message(
                 }
 
                 if block_state.peer_inventory.is_empty() {
-                    let batch = node_state
-                        .download
-                        .lock()
-                        .unwrap()
-                        .pop_batch(DOWNLOAD_BATCH_SIZE);
-                    if !batch.is_empty() {
-                        (
-                            PeerStateMachine::AwaitingBlock(AwaitingBlock {
-                                peer_inventory: batch.iter().cloned().collect(),
-                            }),
-                            vec![create_getdata_message(&batch)],
-                        )
-                    } else {
-                        let locators =
-                            build_block_locators(node_state.chainman.active_chain().tip());
-                        (
-                            PeerStateMachine::AwaitingInv,
-                            vec![create_getblocks_message(locators)],
-                        )
-                    }
+                    request_next_batch(node_state)
                 } else {
                     (PeerStateMachine::AwaitingBlock(block_state), vec![])
                 }
@@ -425,6 +539,25 @@ pub fn process_message(
             }
         },
     }
+}
+
+fn process_idle(
+    state_machine: PeerStateMachine,
+    node_state: &NodeState,
+) -> (PeerStateMachine, Vec<NetworkMessage>) {
+    if !matches!(state_machine, PeerStateMachine::AwaitingInv) {
+        return (state_machine, vec![]);
+    }
+    let mut download = node_state.download.lock().unwrap();
+    let batch = download.pop_batch(DOWNLOAD_BATCH_SIZE);
+    if batch.is_empty() {
+        if !download.queue.is_empty() {
+            download.mark_stall();
+        }
+        return (PeerStateMachine::AwaitingInv, vec![]);
+    }
+    drop(download);
+    request_blocks(batch)
 }
 
 fn stalled(state: &PeerStateMachine, last_progress: Instant) -> bool {
@@ -439,10 +572,23 @@ fn delivers_requested_block(state: &PeerStateMachine, msg: &NetworkMessage) -> b
     )
 }
 
+fn read_messages(
+    mut reader: ConnectionReader,
+    message_tx: mpsc::SyncSender<Result<Option<NetworkMessage>, p2p::net::Error>>,
+) {
+    loop {
+        let message = reader.read_message();
+        let failed = message.is_err();
+        if message_tx.send(message).is_err() || failed {
+            return;
+        }
+    }
+}
+
 pub struct BitcoinPeer {
     dest: Destination,
     writer: Arc<ConnectionWriter>,
-    reader: ConnectionReader,
+    messages: mpsc::Receiver<Result<Option<NetworkMessage>, p2p::net::Error>>,
     state_machine: PeerStateMachine,
     last_progress: Instant,
 }
@@ -473,10 +619,13 @@ impl BitcoinPeer {
         let locators = build_block_locators(node_state.chainman.best_entry().unwrap());
         debug!(target: Category::NET, "Sending headers message...");
         writer.send_message(create_getheaders_message(locators))?;
+        // Reads stop while the peer thread waits on the kernel.
+        let (message_tx, message_rx) = mpsc::sync_channel(0);
+        thread::spawn(move || read_messages(reader, message_tx));
         let peer = BitcoinPeer {
             dest: destination,
             writer: Arc::new(writer),
-            reader,
+            messages: message_rx,
             state_machine: PeerStateMachine::AwaitingHeaders,
             last_progress: Instant::now(),
         };
@@ -491,6 +640,16 @@ impl BitcoinPeer {
         stalled(&self.state_machine, self.last_progress)
     }
 
+    pub fn holds_back_window(&self, download: &Mutex<DownloadState>) -> bool {
+        let PeerStateMachine::AwaitingBlock(state) = &self.state_machine else {
+            return false;
+        };
+        download
+            .lock()
+            .unwrap()
+            .expire_stall_held_by(&state.peer_inventory)
+    }
+
     pub fn release_in_flight(&self, download: &Mutex<DownloadState>) {
         if let PeerStateMachine::AwaitingBlock(state) = &self.state_machine {
             download
@@ -500,11 +659,12 @@ impl BitcoinPeer {
         }
     }
 
-    fn receive_message(&mut self) -> Result<NetworkMessage, p2p::net::Error> {
-        Ok(self
-            .reader
-            .read_message()?
-            .expect("v1 only supported currently"))
+    fn receive_message(&mut self) -> Result<Option<NetworkMessage>, p2p::net::Error> {
+        match self.messages.recv_timeout(PEER_CHECK_INTERVAL) {
+            Ok(message) => Ok(Some(message?.expect("v1 only supported currently"))),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(p2p::net::Error::ChannelClosed),
+        }
     }
 
     pub fn receive_and_process_message(
@@ -512,13 +672,26 @@ impl BitcoinPeer {
         node_state: &NodeState,
     ) -> Result<(), p2p::net::Error> {
         let msg = self.receive_message()?;
-        if let NetworkMessage::Block(block) = &msg {
+        if let Some(NetworkMessage::Block(block)) = &msg {
             debug!(target: Category::NET, "Received block {} from {}", block.block_hash(), self);
         }
-        let delivered = delivers_requested_block(&self.state_machine, &msg);
+        let delivered = msg
+            .as_ref()
+            .is_some_and(|msg| delivers_requested_block(&self.state_machine, msg));
+        if let PeerStateMachine::AwaitingBlock(state) = &self.state_machine {
+            if delivered {
+                node_state
+                    .download
+                    .lock()
+                    .unwrap()
+                    .clear_stall_held_by(&state.peer_inventory);
+            }
+        }
         let old_state = std::mem::take(&mut self.state_machine);
-        let (peer_state_machine, mut messages) =
-            process_message(old_state, msg, &self.dest.addr, node_state);
+        let (peer_state_machine, mut messages) = match msg {
+            Some(msg) => process_message(old_state, msg, &self.dest.addr, node_state),
+            None => process_idle(old_state, node_state),
+        };
         self.state_machine = peer_state_machine;
         let requested = messages.iter().any(|message| {
             matches!(
@@ -553,10 +726,20 @@ mod tests {
         BlockHash::from_byte_array([n; 32])
     }
 
+    fn block_id(hash: BlockHash) -> BlockId {
+        BlockId {
+            height: i32::from(hash.to_byte_array()[0]),
+            hash,
+        }
+    }
+
     fn download(queue: &[BlockHash], in_flight: &[BlockHash]) -> DownloadState {
         DownloadState {
-            queue: queue.iter().copied().collect(),
-            in_flight: in_flight.iter().copied().collect(),
+            queue: queue.iter().map(|&hash| block_id(hash)).collect(),
+            in_flight: in_flight
+                .iter()
+                .map(|&hash| (hash, block_id(hash).height))
+                .collect(),
             ..Default::default()
         }
     }
@@ -596,8 +779,7 @@ mod tests {
     fn pop_batch_marks_in_flight() {
         let mut d = download(&[hash(1), hash(2)], &[]);
         d.pop_batch(2);
-        assert!(d.in_flight.contains(&hash(1)));
-        assert!(d.in_flight.contains(&hash(2)));
+        assert_eq!(d.in_flight, HashMap::from([(hash(1), 1), (hash(2), 2)]));
     }
 
     #[test]
@@ -642,7 +824,32 @@ mod tests {
     }
 
     #[test]
-    fn pop_batch_preserves_fifo_order() {
+    fn pop_batch_stays_within_the_window() {
+        let mut d = DownloadState {
+            queue: BTreeSet::from([
+                BlockId {
+                    height: 1,
+                    hash: hash(1),
+                },
+                BlockId {
+                    height: BLOCK_DOWNLOAD_WINDOW,
+                    hash: hash(2),
+                },
+                BlockId {
+                    height: BLOCK_DOWNLOAD_WINDOW + 1,
+                    hash: hash(3),
+                },
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(d.pop_batch(16), vec![hash(1), hash(2)]);
+        assert!(d.pop_batch(16).is_empty());
+        assert!(d.receive(hash(1)));
+        assert_eq!(d.pop_batch(16), vec![hash(3)]);
+    }
+
+    #[test]
+    fn pop_batch_preserves_height_order() {
         let mut d = download(&[hash(1), hash(2), hash(3), hash(4), hash(5)], &[]);
         assert_eq!(
             d.pop_batch(5),
@@ -705,12 +912,30 @@ mod tests {
     fn requeue_unreceived_restores_queue_and_clears_in_flight() {
         let mut d = download(&[hash(5), hash(6)], &[hash(1), hash(2), hash(3)]);
         d.requeue_unreceived(&HashSet::from([hash(1), hash(2)]));
-        assert_eq!(d.queue.len(), 4);
-        assert!(d.queue.contains(&hash(1)));
-        assert!(d.queue.contains(&hash(2)));
-        assert!(!d.in_flight.contains(&hash(1)));
-        assert!(!d.in_flight.contains(&hash(2)));
-        assert!(d.in_flight.contains(&hash(3)));
+        assert_eq!(
+            d.queue,
+            BTreeSet::from([1, 2, 5, 6].map(|n| block_id(hash(n))))
+        );
+        assert_eq!(d.in_flight, HashMap::from([(hash(3), 3)]));
+    }
+
+    #[test]
+    fn requeue_unreceived_orders_by_height() {
+        let mut d = download(&[hash(9)], &[hash(1), hash(2), hash(5), hash(6)]);
+        d.requeue_unreceived(&HashSet::from([hash(1), hash(2)]));
+        d.requeue_unreceived(&HashSet::from([hash(5), hash(6)]));
+        assert_eq!(
+            d.pop_batch(16),
+            vec![hash(1), hash(2), hash(5), hash(6), hash(9)]
+        );
+    }
+
+    #[test]
+    fn requeue_unreceived_skips_blocks_already_received() {
+        let mut d = download(&[], &[hash(1), hash(2)]);
+        assert!(d.receive(hash(1)));
+        d.requeue_unreceived(&HashSet::from([hash(1), hash(2)]));
+        assert_eq!(d.queue, BTreeSet::from([block_id(hash(2))]));
     }
 
     #[test]
@@ -725,7 +950,7 @@ mod tests {
         let mut d = download(&[hash(1)], &[hash(2)]);
         d.requeue_unreceived(&HashSet::new());
         assert_eq!(d.queue.len(), 1);
-        assert!(d.in_flight.contains(&hash(2)));
+        assert_eq!(d.in_flight, HashMap::from([(hash(2), 2)]));
     }
 
     #[test]
@@ -734,7 +959,85 @@ mod tests {
             received: HashSet::from([hash(1), hash(3), hash(4)]),
             ..Default::default()
         };
-        d.forget_connected([hash(4), hash(3), hash(2), hash(1)]);
+        assert_eq!(d.forget_connected([hash(4), hash(3), hash(2), hash(1)]), 2);
         assert_eq!(d.received, HashSet::from([hash(1)]));
+    }
+
+    fn stalled_for(block: BlockHash, elapsed: Duration) -> Option<Stall> {
+        Some(Stall {
+            block,
+            since: Instant::now() - elapsed,
+        })
+    }
+
+    #[test]
+    fn mark_stall_marks_the_lowest_block_in_flight() {
+        let mut d = download(&[hash(9)], &[hash(5), hash(3)]);
+        d.mark_stall();
+        let marked = d.stall;
+        assert_eq!(marked.map(|stall| stall.block), Some(hash(3)));
+        d.mark_stall();
+        assert_eq!(d.stall, marked);
+    }
+
+    #[test]
+    fn mark_stall_moves_on_once_the_block_arrives() {
+        let mut d = download(&[hash(9)], &[hash(3), hash(5)]);
+        d.mark_stall();
+        assert!(d.receive(hash(3)));
+        d.mark_stall();
+        assert_eq!(d.stall.map(|stall| stall.block), Some(hash(5)));
+    }
+
+    #[test]
+    fn expire_stall_waits_for_the_timeout() {
+        let mut d = download(&[], &[hash(3)]);
+        d.mark_stall();
+        assert!(!d.expire_stall_held_by(&HashSet::from([hash(3)])));
+        assert!(d.stall.is_some());
+    }
+
+    #[test]
+    fn expire_stall_drops_only_the_holder() {
+        let mut d = download(&[], &[hash(3)]);
+        d.stall = stalled_for(hash(3), BLOCK_STALLING_TIMEOUT_DEFAULT * 2);
+        assert!(!d.expire_stall_held_by(&HashSet::from([hash(4)])));
+        assert!(d.expire_stall_held_by(&HashSet::from([hash(3)])));
+        assert_eq!(d.stall, None);
+        assert_eq!(d.stalling_timeout, BLOCK_STALLING_TIMEOUT_DEFAULT * 2);
+    }
+
+    #[test]
+    fn stalling_timeout_doubles_up_to_the_max() {
+        let mut d = download(&[], &[hash(3)]);
+        d.stalling_timeout = Duration::from_secs(40);
+        d.stall = stalled_for(hash(3), Duration::from_secs(41));
+        assert!(d.expire_stall_held_by(&HashSet::from([hash(3)])));
+        assert_eq!(d.stalling_timeout, BLOCK_STALLING_TIMEOUT_MAX);
+    }
+
+    #[test]
+    fn stalling_timeout_shrinks_as_blocks_connect() {
+        let mut d = DownloadState {
+            stalling_timeout: Duration::from_secs(8),
+            ..Default::default()
+        };
+        d.shorten_stalling_timeout(1);
+        assert_eq!(d.stalling_timeout, Duration::from_secs(6));
+        d.shorten_stalling_timeout(100);
+        assert_eq!(d.stalling_timeout, BLOCK_STALLING_TIMEOUT_DEFAULT);
+    }
+
+    #[test]
+    fn stall_clears_when_its_holder_delivers_or_leaves() {
+        let mut d = download(&[], &[hash(3), hash(4)]);
+        d.mark_stall();
+        d.clear_stall_held_by(&HashSet::from([hash(4)]));
+        assert!(d.stall.is_some());
+        d.clear_stall_held_by(&HashSet::from([hash(3)]));
+        assert_eq!(d.stall, None);
+        d.mark_stall();
+        d.requeue_unreceived(&HashSet::from([hash(3)]));
+        assert_eq!(d.stall, None);
     }
 }

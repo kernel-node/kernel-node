@@ -39,7 +39,7 @@ const EMPTY_ADDRESS_BOOK_LIMIT: u32 = 60;
 
 const BROADCAST_TIMEOUT: Duration = Duration::from_secs(60);
 const BROADCAST_PONG_TIMEOUT: Duration = Duration::from_secs(5);
-const FEELER_INTERVAL: Duration = Duration::from_secs(30);
+pub const FEELER_INTERVAL: Duration = Duration::from_secs(30);
 const FLUSH_PEERS_INTERVAL: Duration = Duration::from_secs(60 * 10);
 
 pub struct PeerManager {
@@ -52,6 +52,7 @@ pub struct PeerManager {
     peer_threads: Vec<thread::JoinHandle<()>>,
     peer_writers: Vec<Arc<Mutex<Option<Arc<ConnectionWriter>>>>>,
     connected_peers: Arc<Mutex<HashSet<Destination>>>,
+    connect_only: Vec<Destination>,
     proxy: Option<Socks5Proxy>,
     feeler_thread: Option<thread::JoinHandle<()>>,
     peers_file: Option<PathBuf>,
@@ -76,6 +77,7 @@ impl PeerManager {
             peer_threads: Vec::new(),
             peer_writers: Vec::new(),
             connected_peers: Arc::new(Mutex::new(HashSet::new())),
+            connect_only: Vec::new(),
             proxy: None,
             feeler_thread: None,
             peers_file,
@@ -87,8 +89,9 @@ impl PeerManager {
         self.proxy = Some(proxy);
     }
 
-    pub fn max_peers(mut self, n: usize) -> Self {
-        self.max_peers = n.max(1);
+    pub fn connect_only(mut self, peers: Vec<Destination>) -> Self {
+        self.max_peers = peers.len().max(1);
+        self.connect_only = peers;
         self
     }
 
@@ -109,40 +112,46 @@ impl PeerManager {
             let connected_peers = Arc::clone(&self.connected_peers);
             let fatal = self.fatal.clone();
             let proxy = self.proxy.clone();
+            let connect_to = self.connect_only.get(i).cloned();
 
             let handle = thread::spawn(move || {
                 info!(target: Category::NET, "Peer thread {} started", i);
                 let mut empty_selections = 0u32;
                 while running.load(Ordering::SeqCst) {
-                    let selected = {
-                        let table = addrman.lock().unwrap();
-                        table.select().map(|record| record.network_addr())
-                    };
-                    let destination = match selected {
-                        Some((AddrV2::Ipv4(ipv4), port)) => {
-                            Destination::from_socket_addr(SocketAddr::from((ipv4, port)))
-                        }
-                        Some((AddrV2::Ipv6(ipv6), port)) => {
-                            Destination::from_socket_addr(SocketAddr::from((ipv6, port)))
-                        }
-                        Some((AddrV2::TorV3(pubkey), port)) if proxy.is_some() => {
-                            Destination::new(AddrV2::TorV3(pubkey), port)
-                        }
-                        Some(_) => continue,
+                    let destination = match &connect_to {
+                        Some(peer) => peer.clone(),
                         None => {
-                            empty_selections += 1;
-                            if empty_selections >= EMPTY_ADDRESS_BOOK_LIMIT {
-                                fatal.trigger(
-                                    Category::NET,
-                                    format!(
-                                        "No peer address available for {EMPTY_ADDRESS_BOOK_LIMIT} seconds. \
-                                         DNS seeding likely failed and the network is unreachable."
-                                    ),
-                                );
-                                return;
+                            let selected = {
+                                let table = addrman.lock().unwrap();
+                                table.select().map(|record| record.network_addr())
+                            };
+                            match selected {
+                                Some((AddrV2::Ipv4(ipv4), port)) => {
+                                    Destination::from_socket_addr(SocketAddr::from((ipv4, port)))
+                                }
+                                Some((AddrV2::Ipv6(ipv6), port)) => {
+                                    Destination::from_socket_addr(SocketAddr::from((ipv6, port)))
+                                }
+                                Some((AddrV2::TorV3(pubkey), port)) if proxy.is_some() => {
+                                    Destination::new(AddrV2::TorV3(pubkey), port)
+                                }
+                                Some(_) => continue,
+                                None => {
+                                    empty_selections += 1;
+                                    if empty_selections >= EMPTY_ADDRESS_BOOK_LIMIT {
+                                        fatal.trigger(
+                                            Category::NET,
+                                            format!(
+                                                "No peer address available for {EMPTY_ADDRESS_BOOK_LIMIT} seconds. \
+                                                 DNS seeding likely failed and the network is unreachable."
+                                            ),
+                                        );
+                                        return;
+                                    }
+                                    thread::sleep(Duration::from_secs(1));
+                                    continue;
+                                }
                             }
-                            thread::sleep(Duration::from_secs(1));
-                            continue;
                         }
                     };
                     empty_selections = 0;
@@ -182,6 +191,11 @@ impl PeerManager {
                             let _ = peer.writer().shutdown();
                             break;
                         }
+                        if peer.holds_back_window(&node_state.download) {
+                            warn!(target: Category::NET, "Peer thread {}: holding back the download window, disconnecting {}", i, peer);
+                            let _ = peer.writer().shutdown();
+                            break;
+                        }
                         if let Err(e) = peer.receive_and_process_message(&node_state) {
                             match e {
                                 p2p::net::Error::Io(io)
@@ -204,6 +218,9 @@ impl PeerManager {
                 info!(target: Category::NET, "Peer thread {} stopped", i);
             });
             self.peer_threads.push(handle);
+        }
+        if !self.connect_only.is_empty() {
+            return;
         }
 
         let running = Arc::clone(&self.running);
