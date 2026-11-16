@@ -37,6 +37,8 @@ const MAX_LOCATOR_HASHES: usize = 101;
 const DOWNLOAD_BATCH_SIZE: usize = 16;
 pub const PEER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+/// Measured from the lowest unreceived block.
+pub const BLOCK_DOWNLOAD_WINDOW: i32 = 1024;
 
 // Field order sets the queue order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -54,11 +56,23 @@ pub struct DownloadState {
 
 impl DownloadState {
     fn pop_batch(&mut self, batch_size: usize) -> Vec<BlockHash> {
+        let Some(first) = self.queue.first() else {
+            return Vec::new();
+        };
+        let lowest = self
+            .in_flight
+            .values()
+            .copied()
+            .fold(first.height, i32::min);
         let mut batch = Vec::with_capacity(batch_size);
         while batch.len() < batch_size {
-            let Some(BlockId { height, hash }) = self.queue.pop_first() else {
+            let Some(&BlockId { height, hash }) = self.queue.first() else {
                 break;
             };
+            if height >= lowest + BLOCK_DOWNLOAD_WINDOW {
+                break;
+            }
+            self.queue.pop_first();
             if self.in_flight.insert(hash, height).is_none() {
                 batch.push(hash);
             }
@@ -145,11 +159,11 @@ impl NodeState {
 ///         │                 │ then take the first batch
 ///         │                 ▼
 ///         │    ┌─────────────────┐   block arrives (batch not done), or
-///         │    │  AwaitingBlock  │──┐  batch done + queue has more:
+///         │    │  AwaitingBlock  │──┐  batch done + window has more:
 ///         │    └─────────────────┘◀─┘  take the next batch
 ///         │       ▲         │
-///         │  inv/ │         │ batch done AND queue empty
-///         │  hdrs │         ▼
+///         │ hdrs/ │         │ batch done AND nothing to take
+///         │  idle │         ▼
 ///         │    ┌─────────────────┐   nothing to claim: ask again
 ///         └────│   AwaitingInv   │──┐
 ///              └─────────────────┘◀─┘
@@ -270,6 +284,34 @@ fn create_getdata_message(block_hashes: &[bitcoin::BlockHash]) -> NetworkMessage
     NetworkMessage::GetData(inventory)
 }
 
+fn request_blocks(batch: Vec<BlockHash>) -> (PeerStateMachine, Vec<NetworkMessage>) {
+    let message = create_getdata_message(&batch);
+    (
+        PeerStateMachine::AwaitingBlock(AwaitingBlock {
+            peer_inventory: batch.into_iter().collect(),
+        }),
+        vec![message],
+    )
+}
+
+fn request_next_batch(node_state: &NodeState) -> (PeerStateMachine, Vec<NetworkMessage>) {
+    let mut download = node_state.download.lock().unwrap();
+    let batch = download.pop_batch(DOWNLOAD_BATCH_SIZE);
+    if !batch.is_empty() {
+        return request_blocks(batch);
+    }
+    // Polling while the window is full would loop.
+    if !download.queue.is_empty() {
+        return (PeerStateMachine::AwaitingInv, vec![]);
+    }
+    drop(download);
+    let locators = build_block_locators(node_state.chainman.active_chain().tip());
+    (
+        PeerStateMachine::AwaitingInv,
+        vec![create_getblocks_message(locators)],
+    )
+}
+
 pub fn process_message(
     state_machine: PeerStateMachine,
     event: NetworkMessage,
@@ -309,24 +351,7 @@ pub fn process_message(
 
                 if msg_len != 2000 {
                     populate_download_queue(&node_state.chainman, &node_state.download);
-                    let batch = node_state
-                        .download
-                        .lock()
-                        .unwrap()
-                        .pop_batch(DOWNLOAD_BATCH_SIZE);
-                    if !batch.is_empty() {
-                        return (
-                            PeerStateMachine::AwaitingBlock(AwaitingBlock {
-                                peer_inventory: batch.iter().cloned().collect(),
-                            }),
-                            vec![create_getdata_message(&batch)],
-                        );
-                    }
-                    let locators = build_block_locators(node_state.chainman.active_chain().tip());
-                    return (
-                        PeerStateMachine::AwaitingInv,
-                        vec![create_getblocks_message(locators)],
-                    );
+                    return request_next_batch(node_state);
                 }
 
                 let locators = build_block_locators(node_state.chainman.best_entry().unwrap());
@@ -424,26 +449,7 @@ pub fn process_message(
                 }
 
                 if block_state.peer_inventory.is_empty() {
-                    let batch = node_state
-                        .download
-                        .lock()
-                        .unwrap()
-                        .pop_batch(DOWNLOAD_BATCH_SIZE);
-                    if !batch.is_empty() {
-                        (
-                            PeerStateMachine::AwaitingBlock(AwaitingBlock {
-                                peer_inventory: batch.iter().cloned().collect(),
-                            }),
-                            vec![create_getdata_message(&batch)],
-                        )
-                    } else {
-                        let locators =
-                            build_block_locators(node_state.chainman.active_chain().tip());
-                        (
-                            PeerStateMachine::AwaitingInv,
-                            vec![create_getblocks_message(locators)],
-                        )
-                    }
+                    request_next_batch(node_state)
                 } else {
                     (PeerStateMachine::AwaitingBlock(block_state), vec![])
                 }
@@ -454,6 +460,24 @@ pub fn process_message(
             }
         },
     }
+}
+
+fn process_idle(
+    state_machine: PeerStateMachine,
+    node_state: &NodeState,
+) -> (PeerStateMachine, Vec<NetworkMessage>) {
+    if !matches!(state_machine, PeerStateMachine::AwaitingInv) {
+        return (state_machine, vec![]);
+    }
+    let batch = node_state
+        .download
+        .lock()
+        .unwrap()
+        .pop_batch(DOWNLOAD_BATCH_SIZE);
+    if batch.is_empty() {
+        return (PeerStateMachine::AwaitingInv, vec![]);
+    }
+    request_blocks(batch)
 }
 
 fn stalled(state: &PeerStateMachine, last_progress: Instant) -> bool {
@@ -557,16 +581,18 @@ impl BitcoinPeer {
         &mut self,
         node_state: &NodeState,
     ) -> Result<(), p2p::net::Error> {
-        let Some(msg) = self.receive_message()? else {
-            return Ok(());
-        };
-        if let NetworkMessage::Block(block) = &msg {
+        let msg = self.receive_message()?;
+        if let Some(NetworkMessage::Block(block)) = &msg {
             debug!(target: Category::NET, "Received block {} from {}", block.block_hash(), self);
         }
-        let delivered = delivers_requested_block(&self.state_machine, &msg);
+        let delivered = msg
+            .as_ref()
+            .is_some_and(|msg| delivers_requested_block(&self.state_machine, msg));
         let old_state = std::mem::take(&mut self.state_machine);
-        let (peer_state_machine, mut messages) =
-            process_message(old_state, msg, &self.dest.addr, node_state);
+        let (peer_state_machine, mut messages) = match msg {
+            Some(msg) => process_message(old_state, msg, &self.dest.addr, node_state),
+            None => process_idle(old_state, node_state),
+        };
         self.state_machine = peer_state_machine;
         let requested = messages.iter().any(|message| {
             matches!(
@@ -696,6 +722,31 @@ mod tests {
         let mut d = download(&[hash(1), hash(2)], &[]);
         assert!(d.pop_batch(0).is_empty());
         assert_eq!(d.queue.len(), 2);
+    }
+
+    #[test]
+    fn pop_batch_stays_within_the_window() {
+        let mut d = DownloadState {
+            queue: BTreeSet::from([
+                BlockId {
+                    height: 1,
+                    hash: hash(1),
+                },
+                BlockId {
+                    height: BLOCK_DOWNLOAD_WINDOW,
+                    hash: hash(2),
+                },
+                BlockId {
+                    height: BLOCK_DOWNLOAD_WINDOW + 1,
+                    hash: hash(3),
+                },
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(d.pop_batch(16), vec![hash(1), hash(2)]);
+        assert!(d.pop_batch(16).is_empty());
+        assert!(d.receive(hash(1)));
+        assert_eq!(d.pop_batch(16), vec![hash(3)]);
     }
 
     #[test]
