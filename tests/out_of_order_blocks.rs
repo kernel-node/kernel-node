@@ -1,24 +1,20 @@
 mod common;
 
 use std::collections::HashMap;
-use std::io::{self, BufReader, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::io::{self, BufReader};
+use std::net::{Ipv4Addr, TcpListener};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bitcoin::block::Header;
-use bitcoin::consensus::{serialize, Decodable};
-use bitcoin::io::from_std_mut;
-use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
+use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::Inventory;
-use bitcoin::p2p::message_network::VersionMessage;
-use bitcoin::p2p::{Address, ServiceFlags};
-use bitcoin::{Block, BlockHash, Network};
+use bitcoin::{Block, BlockHash};
+use common::scripted_peer::{receive, send, version};
 use common::{start_bitcoind, TestNode};
 
 const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 const BLOCKS: usize = 10;
-const PROTOCOL_VERSION: u32 = 70016;
 
 #[test]
 fn connects_a_block_that_arrives_before_its_parent() {
@@ -83,34 +79,4 @@ fn serve_in_reverse(listener: TcpListener, blocks: Vec<Block>, height: u64) -> i
             _ => {}
         }
     }
-}
-
-fn version(height: u64) -> VersionMessage {
-    let unused = Address::new(
-        &SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        ServiceFlags::NONE,
-    );
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    VersionMessage {
-        version: PROTOCOL_VERSION,
-        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
-        timestamp: i64::try_from(now.as_secs()).unwrap(),
-        receiver: unused.clone(),
-        sender: unused,
-        nonce: 0,
-        user_agent: "/scripted-peer/".to_string(),
-        start_height: i32::try_from(height).unwrap(),
-        relay: false,
-    }
-}
-
-fn send(stream: &mut TcpStream, payload: NetworkMessage) -> io::Result<()> {
-    let message = RawNetworkMessage::new(Network::Regtest.magic(), payload);
-    stream.write_all(&serialize(&message))
-}
-
-fn receive(reader: &mut BufReader<TcpStream>) -> io::Result<NetworkMessage> {
-    let message =
-        RawNetworkMessage::consensus_decode(from_std_mut(reader)).map_err(io::Error::other)?;
-    Ok(message.into_payload())
 }
