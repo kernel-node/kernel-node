@@ -249,10 +249,12 @@ fn run(
     let peer_writers = peer_manager.peer_writers().to_vec();
     let broadcaster = peer_manager.broadcaster();
 
+    let record_gossip = connect.is_empty();
     let addr_processing_handler = thread::spawn(move || {
         info!(target: Category::NODE, "Starting addr processing thread.");
         while running_addr.load(Ordering::SeqCst) {
             match addr_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(_) if !record_gossip => continue,
                 Ok((source, payload)) => {
                     let mut addr_lock = addrman.lock().unwrap();
                     for address in payload {

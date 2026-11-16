@@ -39,7 +39,7 @@ const EMPTY_ADDRESS_BOOK_LIMIT: u32 = 60;
 
 const BROADCAST_TIMEOUT: Duration = Duration::from_secs(60);
 const BROADCAST_PONG_TIMEOUT: Duration = Duration::from_secs(5);
-const FEELER_INTERVAL: Duration = Duration::from_secs(30);
+pub const FEELER_INTERVAL: Duration = Duration::from_secs(30);
 const FLUSH_PEERS_INTERVAL: Duration = Duration::from_secs(60 * 10);
 
 pub struct PeerManager {
@@ -213,6 +213,9 @@ impl PeerManager {
                 info!(target: Category::NET, "Peer thread {} stopped", i);
             });
             self.peer_threads.push(handle);
+        }
+        if !self.connect_only.is_empty() {
+            return;
         }
 
         let running = Arc::clone(&self.running);
