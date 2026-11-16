@@ -529,6 +529,22 @@ fn main() {
 
     let wallet_for_ipc = Arc::clone(&wallet);
     let chainman_for_ipc = Arc::clone(&node_state.chainman);
+    let signals = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut interrupt = {
+        let _runtime = signals.enter();
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap()
+    };
+    // Losing the IPC thread must not disable Ctrl-C.
+    thread::spawn(move || {
+        signals.block_on(interrupt.recv());
+        info!(target: Category::NODE, "Received shutdown signal");
+        let _ = shutdown_tx.send(());
+    });
+
+    let fatal_ipc = fatal.clone();
     let (ipc_stop_tx, mut ipc_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -541,16 +557,20 @@ fn main() {
                     let sock_file = data_dir + "/node.sock";
                     let _ = std::fs::remove_file(&sock_file);
                     debug!(target: Category::IPC, "Listening for incoming IPC requests");
-                    let unix_socket = UnixListener::bind(sock_file).unwrap();
+                    let unix_socket = match UnixListener::bind(&sock_file) {
+                        Ok(socket) => socket,
+                        Err(e) => {
+                            fatal_ipc.trigger(
+                                Category::IPC,
+                                format!("Could not open the control socket {sock_file}: {e}"),
+                            );
+                            return;
+                        }
+                    };
                     loop {
                         let stream = tokio::select! {
                             unix_bind_res = unix_socket.accept() => {
                                 unix_bind_res.unwrap().0
-                            }
-                            _ctrl_c = tokio::signal::ctrl_c() => {
-                                info!(target: Category::NODE, "Received shutdown signal");
-                                shutdown_tx.clone().send(()).unwrap();
-                                return;
                             }
                             _stop = &mut ipc_stop_rx => {
                                 debug!(target: Category::IPC, "Stopping the IPC listener");
