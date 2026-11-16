@@ -25,7 +25,7 @@ use kernel_node::{
     ipc::{server_capnp::server, IpcInterface},
     logging::Category,
     net::{
-        addr::{resolve_seeds, AddrTable, AddrTableExt},
+        addr::{resolve_seeds, AddrTable, AddrTableExt, Destination},
         manager::PeerManager,
         peer::{DownloadState, NodeState},
         socks5::Socks5Proxy,
@@ -233,7 +233,13 @@ fn run(
         fatal.clone(),
     );
     if !connect.is_empty() {
-        peer_manager = peer_manager.max_peers(connect.len());
+        peer_manager = peer_manager.connect_only(
+            connect
+                .iter()
+                .copied()
+                .map(Destination::from_socket_addr)
+                .collect(),
+        );
     }
     if let Some(proxy) = proxy {
         info!(target: Category::NET, "Using Socks5 proxy for outbound connections");
@@ -243,10 +249,12 @@ fn run(
     let peer_writers = peer_manager.peer_writers().to_vec();
     let broadcaster = peer_manager.broadcaster();
 
+    let record_gossip = connect.is_empty();
     let addr_processing_handler = thread::spawn(move || {
         info!(target: Category::NODE, "Starting addr processing thread.");
         while running_addr.load(Ordering::SeqCst) {
             match addr_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(_) if !record_gossip => continue,
                 Ok((source, payload)) => {
                     let mut addr_lock = addrman.lock().unwrap();
                     for address in payload {

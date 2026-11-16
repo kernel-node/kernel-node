@@ -2,6 +2,7 @@ use std::{
     collections::{HashSet, VecDeque},
     fmt, iter,
     sync::{mpsc, Arc, Mutex},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -34,7 +35,8 @@ use crate::{
 const PROTOCOL_VERSION: ProtocolVersion = 70015;
 const MAX_LOCATOR_HASHES: usize = 101;
 const DOWNLOAD_BATCH_SIZE: usize = 16;
-const PEER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+pub const PEER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+const PEER_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 pub struct DownloadState {
@@ -439,10 +441,23 @@ fn delivers_requested_block(state: &PeerStateMachine, msg: &NetworkMessage) -> b
     )
 }
 
+fn read_messages(
+    mut reader: ConnectionReader,
+    message_tx: mpsc::SyncSender<Result<Option<NetworkMessage>, p2p::net::Error>>,
+) {
+    loop {
+        let message = reader.read_message();
+        let failed = message.is_err();
+        if message_tx.send(message).is_err() || failed {
+            return;
+        }
+    }
+}
+
 pub struct BitcoinPeer {
     dest: Destination,
     writer: Arc<ConnectionWriter>,
-    reader: ConnectionReader,
+    messages: mpsc::Receiver<Result<Option<NetworkMessage>, p2p::net::Error>>,
     state_machine: PeerStateMachine,
     last_progress: Instant,
 }
@@ -473,10 +488,13 @@ impl BitcoinPeer {
         let locators = build_block_locators(node_state.chainman.best_entry().unwrap());
         debug!(target: Category::NET, "Sending headers message...");
         writer.send_message(create_getheaders_message(locators))?;
+        // Reads stop while the peer thread waits on the kernel.
+        let (message_tx, message_rx) = mpsc::sync_channel(0);
+        thread::spawn(move || read_messages(reader, message_tx));
         let peer = BitcoinPeer {
             dest: destination,
             writer: Arc::new(writer),
-            reader,
+            messages: message_rx,
             state_machine: PeerStateMachine::AwaitingHeaders,
             last_progress: Instant::now(),
         };
@@ -500,18 +518,21 @@ impl BitcoinPeer {
         }
     }
 
-    fn receive_message(&mut self) -> Result<NetworkMessage, p2p::net::Error> {
-        Ok(self
-            .reader
-            .read_message()?
-            .expect("v1 only supported currently"))
+    fn receive_message(&mut self) -> Result<Option<NetworkMessage>, p2p::net::Error> {
+        match self.messages.recv_timeout(PEER_CHECK_INTERVAL) {
+            Ok(message) => Ok(Some(message?.expect("v1 only supported currently"))),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(p2p::net::Error::ChannelClosed),
+        }
     }
 
     pub fn receive_and_process_message(
         &mut self,
         node_state: &NodeState,
     ) -> Result<(), p2p::net::Error> {
-        let msg = self.receive_message()?;
+        let Some(msg) = self.receive_message()? else {
+            return Ok(());
+        };
         if let NetworkMessage::Block(block) = &msg {
             debug!(target: Category::NET, "Received block {} from {}", block.block_hash(), self);
         }
