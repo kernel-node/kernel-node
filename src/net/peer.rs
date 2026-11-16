@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt, iter,
     sync::{mpsc, Arc, Mutex},
     thread,
@@ -38,10 +38,17 @@ const DOWNLOAD_BATCH_SIZE: usize = 16;
 pub const PEER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
+// Field order sets the queue order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct BlockId {
+    height: i32,
+    hash: BlockHash,
+}
+
 #[derive(Default)]
 pub struct DownloadState {
-    queue: VecDeque<BlockHash>,
-    in_flight: HashSet<BlockHash>,
+    queue: BTreeSet<BlockId>,
+    in_flight: HashMap<BlockHash, i32>,
     received: HashSet<BlockHash>,
 }
 
@@ -49,25 +56,26 @@ impl DownloadState {
     fn pop_batch(&mut self, batch_size: usize) -> Vec<BlockHash> {
         let mut batch = Vec::with_capacity(batch_size);
         while batch.len() < batch_size {
-            let Some(hash) = self.queue.pop_front() else {
+            let Some(BlockId { height, hash }) = self.queue.pop_first() else {
                 break;
             };
-            if self.in_flight.insert(hash) {
+            if self.in_flight.insert(hash, height).is_none() {
                 batch.push(hash);
             }
         }
         batch
     }
 
-    fn claim(&mut self, hashes: Vec<BlockHash>) -> Vec<BlockHash> {
-        hashes
+    fn claim(&mut self, blocks: Vec<BlockId>) -> Vec<BlockHash> {
+        blocks
             .into_iter()
-            .filter(|hash| self.in_flight.insert(*hash))
+            .filter(|block| self.in_flight.insert(block.hash, block.height).is_none())
+            .map(|block| block.hash)
             .collect()
     }
 
     fn receive(&mut self, hash: BlockHash) -> bool {
-        if !self.in_flight.remove(&hash) {
+        if self.in_flight.remove(&hash).is_none() {
             return false;
         }
         self.received.insert(hash);
@@ -75,14 +83,19 @@ impl DownloadState {
     }
 
     fn requeue_unreceived(&mut self, inventory: &HashSet<BlockHash>) {
-        if inventory.is_empty() {
-            return;
-        }
+        let mut requeued = 0;
         for hash in inventory {
-            self.in_flight.remove(hash);
-            self.queue.push_front(*hash);
+            if let Some(height) = self.in_flight.remove(hash) {
+                self.queue.insert(BlockId {
+                    height,
+                    hash: *hash,
+                });
+                requeued += 1;
+            }
         }
-        debug!(target: Category::NET, "Re-enqueued {} unreceived blocks", inventory.len());
+        if requeued > 0 {
+            debug!(target: Category::NET, "Re-enqueued {} unreceived blocks", requeued);
+        }
     }
 
     fn forget_connected(&mut self, active_from_tip: impl IntoIterator<Item = BlockHash>) {
@@ -195,7 +208,10 @@ fn populate_download_queue(chainman: &ChainstateManager, download: &Mutex<Downlo
         if active.contains(&current) {
             break BlockHash::from_byte_array(current.block_hash().to_bytes());
         }
-        hashes.push(BlockHash::from_byte_array(current.block_hash().to_bytes()));
+        hashes.push(BlockId {
+            height: current.height(),
+            hash: BlockHash::from_byte_array(current.block_hash().to_bytes()),
+        });
         match current.prev() {
             Some(prev) => current = prev,
             None => return,
@@ -205,14 +221,15 @@ fn populate_download_queue(chainman: &ChainstateManager, download: &Mutex<Downlo
         return;
     }
     let fork_height = best_height - hashes.len() as i32;
-    hashes.reverse();
     let mut state = download.lock().unwrap();
     if !state.queue.is_empty() {
         return;
     }
-    let queued: VecDeque<BlockHash> = hashes
+    let queued: BTreeSet<BlockId> = hashes
         .into_iter()
-        .filter(|hash| !state.received.contains(hash) && !state.in_flight.contains(hash))
+        .filter(|block| {
+            !state.received.contains(&block.hash) && !state.in_flight.contains_key(&block.hash)
+        })
         .collect();
     if queued.is_empty() {
         return;
@@ -336,7 +353,17 @@ pub fn process_message(
                         warn!(target: Category::KERNEL, "Rejected announced header {}", block_hash);
                         break;
                     }
-                    announced.push(block_hash);
+                    let height = node_state
+                        .chainman
+                        .get_block_tree_entry(&bitcoinkernel::BlockHash::from(
+                            block_hash.to_byte_array(),
+                        ))
+                        .expect("a valid header is in the block tree")
+                        .height();
+                    announced.push(BlockId {
+                        height,
+                        hash: block_hash,
+                    });
                 }
 
                 if announced.is_empty() {
@@ -574,10 +601,20 @@ mod tests {
         BlockHash::from_byte_array([n; 32])
     }
 
+    fn block_id(hash: BlockHash) -> BlockId {
+        BlockId {
+            height: i32::from(hash.to_byte_array()[0]),
+            hash,
+        }
+    }
+
     fn download(queue: &[BlockHash], in_flight: &[BlockHash]) -> DownloadState {
         DownloadState {
-            queue: queue.iter().copied().collect(),
-            in_flight: in_flight.iter().copied().collect(),
+            queue: queue.iter().map(|&hash| block_id(hash)).collect(),
+            in_flight: in_flight
+                .iter()
+                .map(|&hash| (hash, block_id(hash).height))
+                .collect(),
             ..Default::default()
         }
     }
@@ -617,8 +654,7 @@ mod tests {
     fn pop_batch_marks_in_flight() {
         let mut d = download(&[hash(1), hash(2)], &[]);
         d.pop_batch(2);
-        assert!(d.in_flight.contains(&hash(1)));
-        assert!(d.in_flight.contains(&hash(2)));
+        assert_eq!(d.in_flight, HashMap::from([(hash(1), 1), (hash(2), 2)]));
     }
 
     #[test]
@@ -663,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn pop_batch_preserves_fifo_order() {
+    fn pop_batch_preserves_height_order() {
         let mut d = download(&[hash(1), hash(2), hash(3), hash(4), hash(5)], &[]);
         assert_eq!(
             d.pop_batch(5),
@@ -726,12 +762,30 @@ mod tests {
     fn requeue_unreceived_restores_queue_and_clears_in_flight() {
         let mut d = download(&[hash(5), hash(6)], &[hash(1), hash(2), hash(3)]);
         d.requeue_unreceived(&HashSet::from([hash(1), hash(2)]));
-        assert_eq!(d.queue.len(), 4);
-        assert!(d.queue.contains(&hash(1)));
-        assert!(d.queue.contains(&hash(2)));
-        assert!(!d.in_flight.contains(&hash(1)));
-        assert!(!d.in_flight.contains(&hash(2)));
-        assert!(d.in_flight.contains(&hash(3)));
+        assert_eq!(
+            d.queue,
+            BTreeSet::from([1, 2, 5, 6].map(|n| block_id(hash(n))))
+        );
+        assert_eq!(d.in_flight, HashMap::from([(hash(3), 3)]));
+    }
+
+    #[test]
+    fn requeue_unreceived_orders_by_height() {
+        let mut d = download(&[hash(9)], &[hash(1), hash(2), hash(5), hash(6)]);
+        d.requeue_unreceived(&HashSet::from([hash(1), hash(2)]));
+        d.requeue_unreceived(&HashSet::from([hash(5), hash(6)]));
+        assert_eq!(
+            d.pop_batch(16),
+            vec![hash(1), hash(2), hash(5), hash(6), hash(9)]
+        );
+    }
+
+    #[test]
+    fn requeue_unreceived_skips_blocks_already_received() {
+        let mut d = download(&[], &[hash(1), hash(2)]);
+        assert!(d.receive(hash(1)));
+        d.requeue_unreceived(&HashSet::from([hash(1), hash(2)]));
+        assert_eq!(d.queue, BTreeSet::from([block_id(hash(2))]));
     }
 
     #[test]
@@ -746,7 +800,7 @@ mod tests {
         let mut d = download(&[hash(1)], &[hash(2)]);
         d.requeue_unreceived(&HashSet::new());
         assert_eq!(d.queue.len(), 1);
-        assert!(d.in_flight.contains(&hash(2)));
+        assert_eq!(d.in_flight, HashMap::from([(hash(2), 2)]));
     }
 
     #[test]
