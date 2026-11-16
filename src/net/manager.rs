@@ -191,6 +191,11 @@ impl PeerManager {
                             let _ = peer.writer().shutdown();
                             break;
                         }
+                        if peer.holds_back_window(&node_state.download) {
+                            warn!(target: Category::NET, "Peer thread {}: holding back the download window, disconnecting {}", i, peer);
+                            let _ = peer.writer().shutdown();
+                            break;
+                        }
                         if let Err(e) = peer.receive_and_process_message(&node_state) {
                             match e {
                                 p2p::net::Error::Io(io)

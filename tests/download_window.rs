@@ -5,7 +5,7 @@ use std::io::{self, BufReader};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bitcoin::block::Header;
@@ -14,7 +14,7 @@ use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::{Block, BlockHash};
 use common::scripted_peer::{receive, regtest_chain, send, version};
 use common::TestNode;
-use kernel_node::net::peer::BLOCK_DOWNLOAD_WINDOW;
+use kernel_node::net::peer::{BLOCK_DOWNLOAD_WINDOW, PEER_STALL_TIMEOUT};
 
 const BLOCKS_PAST_WINDOW: u64 = 100;
 const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
@@ -83,17 +83,7 @@ fn waits_at_the_window_for_a_withheld_block() {
     let blocks = regtest_chain(window + BLOCKS_PAST_WINDOW);
     let tip = blocks.last().unwrap().block_hash();
     let chain = Arc::new(Chain::new(blocks));
-
-    let mut peer_addrs = Vec::new();
-    let mut peers = Vec::new();
-    for _ in 0..2 {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        peer_addrs.push(listener.local_addr().unwrap().to_string());
-        let chain = Arc::clone(&chain);
-        peers.push(thread::spawn(move || {
-            let _ = serve(listener, &chain);
-        }));
-    }
+    let (peer_addrs, peers) = serve_two_peers(&chain);
 
     let node = TestNode::start_connected_to(&peer_addrs, None);
     let deadline = Instant::now() + SYNC_TIMEOUT;
@@ -115,6 +105,42 @@ fn waits_at_the_window_for_a_withheld_block() {
     for peer in peers {
         peer.join().unwrap();
     }
+}
+
+#[test]
+fn drops_the_peer_holding_back_the_window() {
+    let window = u64::try_from(BLOCK_DOWNLOAD_WINDOW).unwrap();
+    let blocks = regtest_chain(window + BLOCKS_PAST_WINDOW);
+    let tip = blocks.last().unwrap().block_hash();
+    let chain = Arc::new(Chain::new(blocks));
+    let (peer_addrs, peers) = serve_two_peers(&chain);
+
+    let node = TestNode::start_connected_to(&peer_addrs, None);
+    // Too short for the stall timer to drop the withholder.
+    node.wait_for_tip(chain.height, tip, PEER_STALL_TIMEOUT);
+    assert_eq!(
+        chain.highest_requested_before_first.load(Ordering::SeqCst),
+        window
+    );
+
+    node.stop();
+    for peer in peers {
+        peer.join().unwrap();
+    }
+}
+
+fn serve_two_peers(chain: &Arc<Chain>) -> (Vec<String>, Vec<JoinHandle<()>>) {
+    let mut peer_addrs = Vec::new();
+    let mut peers = Vec::new();
+    for _ in 0..2 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        peer_addrs.push(listener.local_addr().unwrap().to_string());
+        let chain = Arc::clone(chain);
+        peers.push(thread::spawn(move || {
+            let _ = serve(listener, &chain);
+        }));
+    }
+    (peer_addrs, peers)
 }
 
 fn serve(listener: TcpListener, chain: &Chain) -> io::Result<()> {

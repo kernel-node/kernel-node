@@ -39,6 +39,8 @@ pub const PEER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 /// Measured from the lowest unreceived block.
 pub const BLOCK_DOWNLOAD_WINDOW: i32 = 1024;
+pub const BLOCK_STALLING_TIMEOUT_DEFAULT: Duration = Duration::from_secs(2);
+const BLOCK_STALLING_TIMEOUT_MAX: Duration = Duration::from_secs(64);
 
 // Field order sets the queue order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -47,11 +49,30 @@ struct BlockId {
     hash: BlockHash,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Stall {
+    block: BlockHash,
+    since: Instant,
+}
+
 pub struct DownloadState {
     queue: BTreeSet<BlockId>,
     in_flight: HashMap<BlockHash, i32>,
     received: HashSet<BlockHash>,
+    stall: Option<Stall>,
+    stalling_timeout: Duration,
+}
+
+impl Default for DownloadState {
+    fn default() -> Self {
+        DownloadState {
+            queue: BTreeSet::new(),
+            in_flight: HashMap::new(),
+            received: HashSet::new(),
+            stall: None,
+            stalling_timeout: BLOCK_STALLING_TIMEOUT_DEFAULT,
+        }
+    }
 }
 
 impl DownloadState {
@@ -97,6 +118,7 @@ impl DownloadState {
     }
 
     fn requeue_unreceived(&mut self, inventory: &HashSet<BlockHash>) {
+        self.clear_stall_held_by(inventory);
         let mut requeued = 0;
         for hash in inventory {
             if let Some(height) = self.in_flight.remove(hash) {
@@ -112,11 +134,66 @@ impl DownloadState {
         }
     }
 
-    fn forget_connected(&mut self, active_from_tip: impl IntoIterator<Item = BlockHash>) {
+    fn forget_connected(&mut self, active_from_tip: impl IntoIterator<Item = BlockHash>) -> usize {
+        let mut connected = 0;
         for hash in active_from_tip {
             if !self.received.remove(&hash) {
                 break;
             }
+            connected += 1;
+        }
+        connected
+    }
+
+    fn mark_stall(&mut self) {
+        if let Some(stall) = &self.stall {
+            if self.in_flight.contains_key(&stall.block) {
+                return;
+            }
+        }
+        let lowest = self
+            .in_flight
+            .iter()
+            .min_by_key(|(_, &height)| height)
+            .map(|(&hash, _)| hash);
+        self.stall = lowest.map(|block| {
+            debug!(target: Category::NET, "Block {} is holding back the window", block);
+            Stall {
+                block,
+                since: Instant::now(),
+            }
+        });
+    }
+
+    fn clear_stall_held_by(&mut self, inventory: &HashSet<BlockHash>) {
+        if self
+            .stall
+            .as_ref()
+            .is_some_and(|stall| inventory.contains(&stall.block))
+        {
+            self.stall = None;
+        }
+    }
+
+    fn expire_stall_held_by(&mut self, inventory: &HashSet<BlockHash>) -> bool {
+        let Some(stall) = &self.stall else {
+            return false;
+        };
+        if !inventory.contains(&stall.block) || stall.since.elapsed() < self.stalling_timeout {
+            return false;
+        }
+        self.stall = None;
+        self.stalling_timeout = (self.stalling_timeout * 2).min(BLOCK_STALLING_TIMEOUT_MAX);
+        true
+    }
+
+    fn shorten_stalling_timeout(&mut self, blocks_connected: usize) {
+        for _ in 0..blocks_connected {
+            if self.stalling_timeout <= BLOCK_STALLING_TIMEOUT_DEFAULT {
+                break;
+            }
+            let shorter = Duration::from_secs(self.stalling_timeout.as_secs() * 85 / 100);
+            self.stalling_timeout = shorter.max(BLOCK_STALLING_TIMEOUT_DEFAULT);
         }
     }
 }
@@ -138,10 +215,11 @@ impl NodeState {
                 .remove(&BlockHash::from_byte_array(block.hash().into()));
         }
         let tip = self.chainman.active_chain().tip();
-        state.forget_connected(
+        let connected = state.forget_connected(
             iter::successors(Some(tip), |entry| entry.prev())
                 .map(|entry| BlockHash::from_byte_array(entry.block_hash().to_bytes())),
         );
+        state.shorten_stalling_timeout(connected);
     }
 }
 
@@ -302,6 +380,7 @@ fn request_next_batch(node_state: &NodeState) -> (PeerStateMachine, Vec<NetworkM
     }
     // Polling while the window is full would loop.
     if !download.queue.is_empty() {
+        download.mark_stall();
         return (PeerStateMachine::AwaitingInv, vec![]);
     }
     drop(download);
@@ -469,14 +548,15 @@ fn process_idle(
     if !matches!(state_machine, PeerStateMachine::AwaitingInv) {
         return (state_machine, vec![]);
     }
-    let batch = node_state
-        .download
-        .lock()
-        .unwrap()
-        .pop_batch(DOWNLOAD_BATCH_SIZE);
+    let mut download = node_state.download.lock().unwrap();
+    let batch = download.pop_batch(DOWNLOAD_BATCH_SIZE);
     if batch.is_empty() {
+        if !download.queue.is_empty() {
+            download.mark_stall();
+        }
         return (PeerStateMachine::AwaitingInv, vec![]);
     }
+    drop(download);
     request_blocks(batch)
 }
 
@@ -560,6 +640,16 @@ impl BitcoinPeer {
         stalled(&self.state_machine, self.last_progress)
     }
 
+    pub fn holds_back_window(&self, download: &Mutex<DownloadState>) -> bool {
+        let PeerStateMachine::AwaitingBlock(state) = &self.state_machine else {
+            return false;
+        };
+        download
+            .lock()
+            .unwrap()
+            .expire_stall_held_by(&state.peer_inventory)
+    }
+
     pub fn release_in_flight(&self, download: &Mutex<DownloadState>) {
         if let PeerStateMachine::AwaitingBlock(state) = &self.state_machine {
             download
@@ -588,6 +678,15 @@ impl BitcoinPeer {
         let delivered = msg
             .as_ref()
             .is_some_and(|msg| delivers_requested_block(&self.state_machine, msg));
+        if let PeerStateMachine::AwaitingBlock(state) = &self.state_machine {
+            if delivered {
+                node_state
+                    .download
+                    .lock()
+                    .unwrap()
+                    .clear_stall_held_by(&state.peer_inventory);
+            }
+        }
         let old_state = std::mem::take(&mut self.state_machine);
         let (peer_state_machine, mut messages) = match msg {
             Some(msg) => process_message(old_state, msg, &self.dest.addr, node_state),
@@ -860,7 +959,85 @@ mod tests {
             received: HashSet::from([hash(1), hash(3), hash(4)]),
             ..Default::default()
         };
-        d.forget_connected([hash(4), hash(3), hash(2), hash(1)]);
+        assert_eq!(d.forget_connected([hash(4), hash(3), hash(2), hash(1)]), 2);
         assert_eq!(d.received, HashSet::from([hash(1)]));
+    }
+
+    fn stalled_for(block: BlockHash, elapsed: Duration) -> Option<Stall> {
+        Some(Stall {
+            block,
+            since: Instant::now() - elapsed,
+        })
+    }
+
+    #[test]
+    fn mark_stall_marks_the_lowest_block_in_flight() {
+        let mut d = download(&[hash(9)], &[hash(5), hash(3)]);
+        d.mark_stall();
+        let marked = d.stall;
+        assert_eq!(marked.map(|stall| stall.block), Some(hash(3)));
+        d.mark_stall();
+        assert_eq!(d.stall, marked);
+    }
+
+    #[test]
+    fn mark_stall_moves_on_once_the_block_arrives() {
+        let mut d = download(&[hash(9)], &[hash(3), hash(5)]);
+        d.mark_stall();
+        assert!(d.receive(hash(3)));
+        d.mark_stall();
+        assert_eq!(d.stall.map(|stall| stall.block), Some(hash(5)));
+    }
+
+    #[test]
+    fn expire_stall_waits_for_the_timeout() {
+        let mut d = download(&[], &[hash(3)]);
+        d.mark_stall();
+        assert!(!d.expire_stall_held_by(&HashSet::from([hash(3)])));
+        assert!(d.stall.is_some());
+    }
+
+    #[test]
+    fn expire_stall_drops_only_the_holder() {
+        let mut d = download(&[], &[hash(3)]);
+        d.stall = stalled_for(hash(3), BLOCK_STALLING_TIMEOUT_DEFAULT * 2);
+        assert!(!d.expire_stall_held_by(&HashSet::from([hash(4)])));
+        assert!(d.expire_stall_held_by(&HashSet::from([hash(3)])));
+        assert_eq!(d.stall, None);
+        assert_eq!(d.stalling_timeout, BLOCK_STALLING_TIMEOUT_DEFAULT * 2);
+    }
+
+    #[test]
+    fn stalling_timeout_doubles_up_to_the_max() {
+        let mut d = download(&[], &[hash(3)]);
+        d.stalling_timeout = Duration::from_secs(40);
+        d.stall = stalled_for(hash(3), Duration::from_secs(41));
+        assert!(d.expire_stall_held_by(&HashSet::from([hash(3)])));
+        assert_eq!(d.stalling_timeout, BLOCK_STALLING_TIMEOUT_MAX);
+    }
+
+    #[test]
+    fn stalling_timeout_shrinks_as_blocks_connect() {
+        let mut d = DownloadState {
+            stalling_timeout: Duration::from_secs(8),
+            ..Default::default()
+        };
+        d.shorten_stalling_timeout(1);
+        assert_eq!(d.stalling_timeout, Duration::from_secs(6));
+        d.shorten_stalling_timeout(100);
+        assert_eq!(d.stalling_timeout, BLOCK_STALLING_TIMEOUT_DEFAULT);
+    }
+
+    #[test]
+    fn stall_clears_when_its_holder_delivers_or_leaves() {
+        let mut d = download(&[], &[hash(3), hash(4)]);
+        d.mark_stall();
+        d.clear_stall_held_by(&HashSet::from([hash(4)]));
+        assert!(d.stall.is_some());
+        d.clear_stall_held_by(&HashSet::from([hash(3)]));
+        assert_eq!(d.stall, None);
+        d.mark_stall();
+        d.requeue_unreceived(&HashSet::from([hash(3)]));
+        assert_eq!(d.stall, None);
     }
 }
