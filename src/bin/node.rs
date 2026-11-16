@@ -25,7 +25,7 @@ use kernel_node::{
     ipc::{server_capnp::server, IpcInterface},
     logging::Category,
     net::{
-        addr::{resolve_seeds, AddrTable, AddrTableExt},
+        addr::{resolve_seeds, AddrTable, AddrTableExt, Destination},
         manager::PeerManager,
         peer::{DownloadState, NodeState},
         socks5::Socks5Proxy,
@@ -233,7 +233,13 @@ fn run(
         fatal.clone(),
     );
     if !connect.is_empty() {
-        peer_manager = peer_manager.max_peers(connect.len());
+        peer_manager = peer_manager.connect_only(
+            connect
+                .iter()
+                .copied()
+                .map(Destination::from_socket_addr)
+                .collect(),
+        );
     }
     if let Some(proxy) = proxy {
         info!(target: Category::NET, "Using Socks5 proxy for outbound connections");
