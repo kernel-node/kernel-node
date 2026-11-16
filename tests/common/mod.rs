@@ -2,7 +2,7 @@
 
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, ExitStatus, Output};
 use std::time::{Duration, Instant};
 
 use bitcoin::hashes::Hash;
@@ -290,14 +290,30 @@ impl TestNode {
             "cli stop failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        self.wait_for_exit("stop");
+        self.tempdir.take().unwrap()
+    }
+
+    pub fn interrupt(mut self) {
+        let pid = self.process.id().to_string();
+        assert!(Command::new("kill")
+            .args(["-INT", &pid])
+            .status()
+            .unwrap()
+            .success());
+        let status = self.wait_for_exit("ctrl-c");
+        assert!(status.success(), "node exited with {status} after ctrl-c");
+    }
+
+    fn wait_for_exit(&mut self, after: &str) -> ExitStatus {
         let deadline = Instant::now() + STOP_TIMEOUT;
         while Instant::now() < deadline {
-            if self.process.try_wait().unwrap().is_some() {
-                return self.tempdir.take().unwrap();
+            if let Some(status) = self.process.try_wait().unwrap() {
+                return status;
             }
             std::thread::sleep(POLL_INTERVAL);
         }
-        panic!("node did not exit within {STOP_TIMEOUT:?} after stop");
+        panic!("node did not exit within {STOP_TIMEOUT:?} after {after}");
     }
 
     fn socket_path(&self) -> PathBuf {
